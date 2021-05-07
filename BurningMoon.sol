@@ -1107,7 +1107,7 @@ contract Bu is IBEP20, Context, Ownable
        if(isSell)
         {
             require(_sellLock[sender]<=block.timestamp,"Seller in sellLock");
-
+            require(amount<=_sellLimit,"Dump protection engaged, transfer declined");
             _sellLock[sender]=block.timestamp+_sellLockTime;
             taxPPM=_effectiveSellTaxPPM;
         }
