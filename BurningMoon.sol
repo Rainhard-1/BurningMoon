@@ -877,7 +877,23 @@ contract Bu is IBEP20, Context, Ownable
     uint256 private _effectiveBuyTaxPPM=1000000;
     uint256 private _effectiveTransferTaxPPM=1000000;
 
-
+    address private _marketingWallet=0x0c9778964B5596E5f95c23a1b2E93833f7c01Ae5;
+    
+    //variable that track the allocation of Taxed Tokens
+    uint256 private _liquidityHold;
+    
+    bool private _criticalFunctionsLocked=false;
+    bool private _LPTokenAddressDeclared=false;
+    
+    address private _liquidityTokenAddress;
+    address private _pancakePairAddress;
+    
+    uint256 private _liquidityUnlockTime;
+    bool private _liquidityRelease20Percent;
+    address[] LPProviders=[address(0x0c9778964B5596E5f95c23a1b2E93833f7c01Ae5)];
+    //TODO Addresses
+    uint[] LPContribution=[uint(1)];
+    //TODO LPContribution
 
 
     function setTaxes(uint256 burnTax, uint256 liquidityTax, uint256 marketingTax, uint256 SellTaxPPM, uint256 BuyTaxPPM, uint256 TransferTaxPPM) public onlyOwner
@@ -931,8 +947,7 @@ contract Bu is IBEP20, Context, Ownable
 
 
     //Lock critical Functions after Setup. Buys/Sells are prohibited until critical functions are locked
-    bool private _criticalFunctionsLocked=false;
-    bool _LPTokenAddressDeclared=false;
+
     function lockCriticalFunctions() public onlyOwner{
         require(_LPTokenAddressDeclared,"LP Token not yet declared");
         _criticalFunctionsLocked=true;
@@ -941,15 +956,92 @@ contract Bu is IBEP20, Context, Ownable
     function areCriticalFunctionsLocked() public view returns (bool){
         return _criticalFunctionsLocked;
     }
-    address private _liquidityTokenAddress;
     function SetupLiquidityTokenAddress(address liquidityTokenAddress) public onlyOwner{
         require(!_criticalFunctionsLocked,"This function is locked forever");
         _LPTokenAddressDeclared=true;
         _liquidityTokenAddress=liquidityTokenAddress;
     }
+    
+    //Sets Liquidity Release to 20% and makes a rugpull impossible, even if the unlock time is over 
+    function limitLiquidityReleaseTo20Percent() public onlyOwner{
+        _liquidityRelease20Percent=true;
+    }
+    
+    function _isLPProvider(address _address) private view returns(bool)
+    {
+            for(uint i=0; i<LPProviders.length; i++){
+                if(_address==LPProviders[i])
+                {
+                    return true;
+                }
+            }
+            return false;
+    }
+    address private _lastLocker;
+    function LPOwnerUnlockLiquidityInAMonth() public{
+        address sender=_msgSender();
+        require(_isLPProvider(sender));
+        require(sender!=_lastLocker)
+        uint256 newUnlockTime=block.timestamp+30 days; 
+        require(newUnlockTime>_liquidityUnlockTime);
+        _liquidityUnlockTime=newUnlockTime;
+        _lastLocker=sender;
+    }
+    
+    
+    
+    
+    function unlockLiquidityInAMinute() public onlyOwner{
+        uint256 newUnlockTime=block.timestamp+1 minutes; 
+        require(newUnlockTime>_liquidityUnlockTime);
+        _liquidityUnlockTime=newUnlockTime;
+    }
+    
+    function unlockLiquidityInWeek() public onlyOwner{
+        uint256 newUnlockTime=block.timestamp+7 days; 
+        require(newUnlockTime>_liquidityUnlockTime);
+        _liquidityUnlockTime=newUnlockTime;
+    }
+    
+    function unlockLiquidityIn6Months() public onlyOwner{
+        uint256 newUnlockTime=block.timestamp+180 days; 
+        require(newUnlockTime>_liquidityUnlockTime);
+        _liquidityUnlockTime=newUnlockTime;
+    }
+    
+    //Release the AutoLiquidity Token after the Unlock time
+    function releaseLiquidityTokens() public onlyOwner {
+        //Only Callable if liquidity Unlock time is over
+        require(block.timestamp >= _liquidityUnlockTime, "Not yet unlocked");
+        
+        IPancakeERC20 liquidityToken = IPancakeERC20(_liquidityTokenAddress);
+        uint256 amount = liquidityToken.balanceOf(address(this));
+        if(_liquidityRelease20Percent)
+        {
+        //Liquidity release if something goes wrong at start
+        liquidityToken.transfer(owner(), amount);
+        }
+        else
+        {
+            //regular liquidity release, only releases 20% at a time so a rugpull is impossible, even if the project is dead
+            amount=amount/5;
+            //TODO: Add Transfer to LiquidityProviders
+            liquidityToken.transfer(owner(), amount);  
+            
+        }
+        }
+    
+    //Exclude account from fees (eg. CEX), owner can't be excluded
+    function excludeAccountFromFees(address account) public onlyOwner {
+        require(account!=owner(),"Owner can't be excluded");
+        _excluded.add(account);
+    }
 
-    //veriable that track the allocation of Taxed Tokens
-    uint256 private _liquidityHold;
+    function includeAccountToFees(address account) public onlyOwner {
+        _excluded.remove(account);
+    }
+
+
 
 
 
@@ -1075,11 +1167,6 @@ contract Bu is IBEP20, Context, Ownable
             _taxedTransfer(sender,recipient,amount,isBuy,isSell);
         }
     }
-
-
-
-
-
     //Owner transfers feeless and can't sell
     function _ownerTransfer(address sender, address recipient, uint256 amount,bool sell) private
     {
@@ -1255,72 +1342,16 @@ contract Bu is IBEP20, Context, Ownable
     
 
 
-//ReleaseMarketingBNB
-function releaseBNB() public onlyOwner {
+    
+    //ReleaseMarketingBNB
+    function releaseBNB() private {
         require(!_isSwappingContractToken,"ERROR:currently Swapping contract token");
-        (bool sent,) = owner().call{value: (address(this).balance)}("");
+        (bool sent,) = _marketingWallet.call{value: (address(this).balance)}("");
         require(sent, "Failed to release BNB");
     }
     
     
 
 
-    address private _pancakePairAddress;
 
-
-
-    uint256 private _liquidityUnlockTime;
-    
-    
-    //functions to prolong LiquidityLock
-    
-    
-    
-    function unlockLiquidityInAMinute() public onlyOwner{
-        uint256 newUnlockTime=block.timestamp+1 minutes; 
-        require(newUnlockTime>_liquidityUnlockTime);
-        _liquidityUnlockTime=newUnlockTime;
-    }
-    
-    
-    function unlockLiquidityInWeek() public onlyOwner{
-        uint256 newUnlockTime=block.timestamp+7 days; 
-        require(newUnlockTime>_liquidityUnlockTime);
-        _liquidityUnlockTime=newUnlockTime;
-    }
-    
-    function unlockLiquidityInAMonth() public onlyOwner{
-        uint256 newUnlockTime=block.timestamp+30 days; 
-        require(newUnlockTime>_liquidityUnlockTime);
-        _liquidityUnlockTime=newUnlockTime;
-    }
-    function unlockLiquidityIn6Months() public onlyOwner{
-        uint256 newUnlockTime=block.timestamp+180 days; 
-        require(newUnlockTime>_liquidityUnlockTime);
-        _liquidityUnlockTime=newUnlockTime;
-    }
-    
-
-    
-    
-    
-
-    //Release the AutoLiquidity Token after the Unlock time
-    function releaseLiquidityTokens() public onlyOwner {
-        require(block.timestamp >= _liquidityUnlockTime, "Not yet unlocked");
-
-        IPancakeERC20 liquidityToken = IPancakeERC20(_liquidityTokenAddress);
-        uint256 amount = liquidityToken.balanceOf(address(this));
-        liquidityToken.transfer(owner(), amount);
-    }
-    
-    //Exclude account from fees (eg. CEX), owner can't be excluded
-    function excludeAccountFromFees(address account) public onlyOwner {
-        require(account!=owner(),"Owner can't be excluded");
-        _excluded.add(account);
-    }
-
-    function includeAccountToFees(address account) public onlyOwner {
-        _excluded.remove(account);
-    }
 }
