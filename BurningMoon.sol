@@ -513,10 +513,6 @@ library Address {
 
 
 
-
-
-
-
 pragma solidity ^0.8.3;
 
 /**
@@ -830,10 +826,14 @@ contract Bu is IBEP20, Context, Ownable
 {
     using Address for address;
     using EnumerableSet for EnumerableSet.AddressSet;
+    
     mapping (address => uint256) private _balances;
     mapping (address => mapping (address => uint256)) private _allowances;
+    
     mapping (address => uint256) private _sellLock;
     EnumerableSet.AddressSet private _excluded;
+    EnumerableSet.AddressSet private _lotteryParticipants;
+    
     IPancakeRouter02 private _pancakeRouter;
     event SwapAutoLiquidity(uint256 tokens, uint256 bnb);
     event Burn(uint256 amount);
@@ -848,6 +848,7 @@ contract Bu is IBEP20, Context, Ownable
     //variables that track balanceLimit and sellLimit, get updated based on remaining supply, once contract gets locked or manually 
     uint256 private  _balanceLimit = _totalSupply;
     uint256 private  _sellLimit = _totalSupply;
+    uint256 private _lotteryMin=_totalSupply;
 
 
     //Lock for Swap Function
@@ -883,7 +884,7 @@ contract Bu is IBEP20, Context, Ownable
         _pancakeRouter = IPancakeRouter02(0x10ED43C718714eb63d5aA57B78B54704E256024E);
         _pancakePairAddress = IPancakeFactory(_pancakeRouter.factory()).createPair(address(this), _pancakeRouter.WETH());
         _liquidityUnlockTime=block.timestamp;
-        setMarketingAddress(0);
+        setMarketingAddress(0,false);
         setDonationAddress(0);
     }
 
@@ -964,6 +965,9 @@ contract Bu is IBEP20, Context, Ownable
         {
             require(_sellLock[sender]<=timeNow,"Seller in sellLock");
             require(amount<=_sellLimit,"Dump protection engaged, transfer declined");
+            //All sells remove seller from the lottery pot
+            _lotteryParticipants.remove(sender); 
+            
             _sellLock[sender]=timeNow+_sellLockTime;
             taxPPM=_effectiveSellTaxPPM;
         }
@@ -973,6 +977,12 @@ contract Bu is IBEP20, Context, Ownable
             if(isBuy)
             {
                 taxPPM=_effectiveBuyTaxPPM;
+                //Buys above the min lottery treshold add the buyer to the lottery pot
+                if(amount>=_lotteryMin)
+                {
+                    _lotteryParticipants.add(recipient); 
+                }
+
             }
             else
             {
@@ -1199,27 +1209,35 @@ contract Bu is IBEP20, Context, Ownable
     
     //Transfer to Marketing Wallet
     function _releaseMarketingBNB(uint256 amount) private {
-        (bool sent,) = _marketingWallet.call{value: (amount)}("");
-        require(sent, "Failed to release BNB");
+        _marketingWallet.call{value: (amount)}("");
+
     }
     
     //Donate to set Donation Address
     function _donateBNB(uint256 amount) private {
         
-        (bool sent,) = _donationWallet.call{value: (amount)}("");
-        require(sent, "Failed to release BNB");
+       _donationWallet.call{value: (amount)}("");
     }
     
+    function _random(uint256 limit) private view returns (uint256) {
+        uint256 random = uint256(keccak256(abi.encodePacked(block.difficulty, block.timestamp))) % limit;
+        return random;
+    }
+    
+    address private _lastLotteryWinner;
     //Randomly picks Lottery winner according to lottery rules
-    function _drawLotteryWinner(uint256 lotteryAmount) private{
+    function _drawLotteryWinner(uint256 amount) private{
         
+        if (amount!=0) {
+            uint256 winner=_random(_lotteryParticipants.length());
+                uint256 randomIndex = _random(_lotteryParticipants.length());
+                address winnerAddress = _lotteryParticipants.at(randomIndex);
+                winnerAddress.call{value: (amount)}("");
+                _lastLotteryWinner=winnerAddress;
+        }
     }
     
 
-
-
-
-    
     
     
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1285,25 +1303,27 @@ contract Bu is IBEP20, Context, Ownable
         return fee;
     }
    
-       //public onlyOwner
+
+    //manually convert token on contract
     function convertContractToken() public onlyOwner
     {
     _convertContractToken();
     }
     
-    //Exclude account from fees (eg. CEX), owner can't be excluded
+    //Exclude/Include account from fees (eg. CEX), owner can't be excluded
     function excludeAccountFromFees(address account) public onlyOwner {
         require(account!=owner(),"Owner can't be excluded");
         _excluded.add(account);
     }
-
     function includeAccountToFees(address account) public onlyOwner {
         _excluded.remove(account);
     }
 
+    //Updates Limits to the current supply
     function updateLimits() public onlyOwner{
-        _sellLimit = _totalSupply * 5 / 10000;
-        _balanceLimit = _totalSupply * 5 / 1000;
+        _sellLimit = _totalSupply * 5 / 10000;      // 50.000 Token at start
+        _balanceLimit = _totalSupply * 5 / 1000;    //500.000 Token at start
+        _lotteryMin = _totalSupply/50000;           //  2.000 Token at start
     }
     
     
@@ -1525,12 +1545,4 @@ contract Bu is IBEP20, Context, Ownable
         return true;
     }
 
-
-    
-    
-    
-    
-    
-    
-    
 }
