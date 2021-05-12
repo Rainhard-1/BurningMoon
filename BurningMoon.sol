@@ -851,28 +851,30 @@ contract Bu is IBEP20, Context, Ownable
     uint256 private _lotteryMin=_totalSupply;
 
 
-    //Lock for Swap Function
-    bool private _isSwappingContractToken;
-    modifier swapContractToken {
-        _isSwappingContractToken = true;
-        _;
-       _isSwappingContractToken = false;
-    }
-
 
 
     //Sellers get locked for 2 hours so they can't dump repeatedly
-    uint256 private constant _sellLockTime= 2 hours;
+    //TODO change SellLock
+    uint256 private constant _sellLockTime= 2 minutes;
     
     
     
     //variable that track the allocation of Taxed Tokens
-    uint256 private _liquidityHold;
     address private _pancakePairAddress;
 
+    uint256 _liquidityBalance;
+    uint256 _marketingBalance;
 
 
-
+    //Lock for Swap Function
+    bool private _isSwappingContractToken;
+    bool private _isSwappingContractModifier;
+    modifier lockTheSwap {
+        _isSwappingContractModifier = true;
+        _;
+        _isSwappingContractModifier = false;
+    }
+    
     
 
     //Constructor
@@ -922,7 +924,8 @@ contract Bu is IBEP20, Context, Ownable
         bool isSell=recipient==_pancakePairAddress|| recipient == pancakeRouter;
 
 
-        if(isContractTransfer||isLiquidityTransfer||isExcluded)
+        if(isContractTransfer||isLiquidityTransfer||isExcluded
+        ||_isSwappingContractToken||_isSwappingContractModifier)
         {
             _feelessTransfer(sender, recipient, amount);
         }
@@ -930,7 +933,8 @@ contract Bu is IBEP20, Context, Ownable
         {
             _ownerTransfer(sender, recipient, amount, isSell);
         }
-        else 
+
+        else
         {
             //can't buy or sell if critical functions are still unlocked 
             require(_criticalFunctionsLocked,"Contract isn't locked yet");
@@ -959,24 +963,24 @@ contract Bu is IBEP20, Context, Ownable
         uint256 recipientBalance = _balances[recipient];
         uint256 senderBalance = _balances[sender];
         require(senderBalance >= amount, "Transfer amount exceeds balance");
-        uint256 taxPPM;
-        uint256 timeNow=block.timestamp;
+        uint256 tax=100;
        if(isSell)
         {
-            require(_sellLock[sender]<=timeNow,"Seller in sellLock");
+            require(_sellLock[sender]<=block.timestamp,"Seller in sellLock");
             require(amount<=_sellLimit,"Dump protection engaged, transfer declined");
             //All sells remove seller from the lottery pot
             _lotteryParticipants.remove(sender); 
             
-            _sellLock[sender]=timeNow+_sellLockTime;
-            taxPPM=_effectiveSellTaxPPM;
+            //Add Sell Lock for sellers
+            _sellLock[sender]=block.timestamp+_sellLockTime;
+            tax=_effectiveSellTax;
         }
         else
         {
             require(recipientBalance+amount<=_balanceLimit,"whale protection engaged, transfer declined");
             if(isBuy)
             {
-                taxPPM=_effectiveBuyTaxPPM;
+                tax=_effectiveBuyTax;
                 //Buys above the min lottery treshold add the buyer to the lottery pot
                 if(amount>=_lotteryMin)
                 {
@@ -986,49 +990,65 @@ contract Bu is IBEP20, Context, Ownable
             }
             else
             {
-                require(_sellLock[sender]<=timeNow,"Sender in Lock");
-                taxPPM=_effectiveTransferTaxPPM;
+                require(_sellLock[sender]<=block.timestamp,"Sender in Lock");
+                tax=_effectiveTransferTax;
             }
         }
         
-        
-
         //Handle LP And Marketing BNB Generation once hold exceeds treshold
-        if(!_isSwappingContractToken&&(_liquidityHold>_sellLimit/2)&&(sender!=_pancakePairAddress))
+        bool isSwapPossible=((sender!=_pancakePairAddress)&&(!_manualConversion));
+        
+        if(_liquidityBalance>=_sellLimit/2&&isSwapPossible)
         {
-            _convertContractToken();
+            //Sell taxed token and convert them to LP witch are locked in the contract
+            _swapAutoLiquidity();
+        } 
+        else if(_marketingBalance>=_sellLimit/2&&isSwapPossible)
+        {
+            //sell taxed token for BNB
+            _swapMarketingBNB();
         }
         else
         {
-                _handleBNBRelease();
+            //Handle the release of marketing BNB
+            _handleBNBRelease();    
         }
 
+            
+        
+
+        //Handle taxes
         uint256 taxedAmount=amount;
-        uint256 tokensToBeBurnt=_calculateFee(amount, _burnTax*taxPPM/1000000);
-        uint256 tokensToBeCollected=_calculateFee(amount, (_marketingTax+_liquidityTax)*taxPPM/1000000);  
-        taxedAmount-=(tokensToBeCollected+tokensToBeBurnt);
+        
+        uint256 tokensToBeBurnt=_calculateFee(amount, _burnTax, tax);
+        uint256 marketingToken=_calculateFee(amount,_marketingTax, tax);
+        uint256 liquidityToken=_calculateFee(amount,_liquidityTax, tax);
         
         
-        _liquidityHold+=tokensToBeCollected;
+        taxedAmount-=_calculateFee(amount,_totalTax, tax);
 
-        _balances[address(this)] += tokensToBeCollected;
-        
 
-        _balances[sender]=senderBalance-amount;
-        _balances[recipient]=recipientBalance+taxedAmount;
+        _marketingBalance+=marketingToken;
+        _liquidityBalance+=liquidityToken;
+        _balances[address(this)] += marketingToken+liquidityToken;
+        
+        _balances[sender]-=amount;
+        _balances[recipient]+=taxedAmount;
         
         _totalSupply-=tokensToBeBurnt;
 
         emit Transfer(sender,recipient,taxedAmount);
+        
+
     }
 
     function _feelessTransfer(address sender, address recipient, uint256 amount) private
     {
-        uint256 recipientBalance = _balances[recipient];
+
         uint256 senderBalance = _balances[sender];
         require(senderBalance >= amount, "Transfer amount exceeds balance");
         _balances[sender]=senderBalance-amount;
-        _balances[recipient]=recipientBalance+amount;
+        _balances[recipient]+=amount;
 
         emit Transfer(sender,recipient,amount);
     }
@@ -1041,41 +1061,54 @@ contract Bu is IBEP20, Context, Ownable
     //Functions to convert Taxes to LP and BNB//////////////////////////////////////////////////////////////
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
     
-    function _convertContractToken() private swapContractToken
-    {
-        uint256 totalCollectTax=(_liquidityTax+_marketingTax);
+    function _swapAutoLiquidity() private lockTheSwap{
+        _isSwappingContractToken=true;
         
-        //Calculate How much Tokens should be allocated for liquidity and Marketing
-        uint256 TokensForLiquidity=_liquidityHold*_liquidityTax/totalCollectTax;
-        uint256 TokensForMarketing=_liquidityHold-TokensForLiquidity;
-        _liquidityHold=0;
+        //make sure to swap less tokens than balance
+        uint256 token=_liquidityBalance;
+        _liquidityBalance=0;
+        uint256 _tokenBalance=_balances[address(this)];
+        if(token>_tokenBalance)
+        {
+            token=_tokenBalance;
+        }
+        //split token in 2 halves
+        uint256 half = token / 2;
+        uint256 otherHalf=token-half;
         
-        //Calculate how much of the token get traded for BNB
-        uint256 liqToken = TokensForLiquidity / 2;
-        uint256 tokensToTradeToBNB=liqToken+TokensForMarketing;
-         
-        //trade the token
-        uint256 initialBNB=address(this).balance;
-        _swapContractTokenForBNB(tokensToTradeToBNB);
-        uint256 receivedBNB=address(this).balance-initialBNB;
+        //swap otherHalf for BNB
+        uint256 initialBNBBalance = address(this).balance;
+        _swapTokenForBNB(otherHalf);
+        uint256 newBalance = address(this).balance - initialBNBBalance;
         
-        //Calculate how many of the bnb belong to liquidity
-        uint256 liqBNB=receivedBNB*liqToken/tokensToTradeToBNB;
         
-        //Substract fee for Transactions
-        //uint256 transferFee = _calculateFee(liqToken, 1);
-        //liqToken -= transferFee;
-        //uint256 bnbTransferFee = _calculateFee(liqBNB, 1);
-        //liqBNB -= bnbTransferFee;
-        
-        //Convert Token to BNB
-        _addLiquidity(liqToken, liqBNB);
-
+        _addLiquidity(half, newBalance);
+        _isSwappingContractToken=false;
     }
+    
+    function _swapMarketingBNB() private lockTheSwap{
+        _isSwappingContractToken=true;
+        
+        
+        //make sure to swap less tokens than balance
+        uint256 token=_marketingBalance;
+        _marketingBalance=0;
+        uint256 _tokenBalance=_balances[address(this)];
+        if(token>_tokenBalance)
+        {
+            token=_tokenBalance;
+        }
+
+        _swapTokenForBNB(token);
+        _isSwappingContractToken=false;
+    }
+    
+    
+    
  
 
     //helper function to swap tokens on contract address to BNB
-    function _swapContractTokenForBNB(uint256 amount) private {
+    function _swapTokenForBNB(uint256 amount) private {
         _approve(address(this), address(_pancakeRouter), amount);
 
         address[] memory path = new address[](2);
@@ -1090,7 +1123,6 @@ contract Bu is IBEP20, Context, Ownable
             block.timestamp
         );
     }
-    
     //helper function to swap tokens and BNB for LP-Token
     function _addLiquidity(uint256 tokenAmount, uint256 bnbAmount) private {
         _approve(address(this), address(_pancakeRouter), tokenAmount);
@@ -1112,24 +1144,25 @@ contract Bu is IBEP20, Context, Ownable
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
     //Functions to handle MarketingBNB//////////////////////////////////////////////////////////////////////
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
-    uint256 _releaseFrequency=1 days;
+    
+    //TODO: Change Marketing Wallets, Donation Wallets, and _releaseFrequency
+    uint256 _releaseFrequency=2 minutes;
     
     //Time of the next release of MarketingBNB
     uint256 private _nextBNBRelease;
     
     uint private _releaseDay;
     bool private _manualRelease;
+    bool private _manualConversion;
     //List of availavle donationWallets
-    address[] _donationWallets=[0x3c8cB169281196737c493AfFA8F49a9d823bB9c5 
-        ];
+    address[] _donationWallets=[0x0c9778964B5596E5f95c23a1b2E93833f7c01Ae5,0x51d8254866042fd1f512CAEE4a11218061AA2636];
     //Active donationWallet
-    address private _donationWallet=0x3c8cB169281196737c493AfFA8F49a9d823bB9c5;
+    address private _donationWallet;
     //Active marketingWallet
     
         //List of availavle marketingWallets
-    address[] _marketingWallets=[0x3c8cB169281196737c493AfFA8F49a9d823bB9c5 
-        ];
-    address private _marketingWallet=0x0c9778964B5596E5f95c23a1b2E93833f7c01Ae5;
+    address[] _marketingWallets=[0x0c9778964B5596E5f95c23a1b2E93833f7c01Ae5,0x51d8254866042fd1f512CAEE4a11218061AA2636];
+    address private _marketingWallet;
     
     
     
@@ -1159,6 +1192,9 @@ contract Bu is IBEP20, Context, Ownable
         _manualRelease=manualRelease;
     }
     
+    function switchManualContractTokenConversion(bool manualConversion) public onlyOwner{
+        _manualConversion=manualConversion;
+    }
     function manualBNBRelease() public onlyOwner{
         _releaseBNB();
     }
@@ -1175,8 +1211,7 @@ contract Bu is IBEP20, Context, Ownable
     }
     function _releaseBNB() private{
     
-        uint256 timeNow=block.timestamp;
-        if(_nextBNBRelease<=timeNow)
+        if(_nextBNBRelease<=block.timestamp)
         {
             return;
         }
@@ -1229,7 +1264,6 @@ contract Bu is IBEP20, Context, Ownable
     function _drawLotteryWinner(uint256 amount) private{
         
         if (amount!=0) {
-            uint256 winner=_random(_lotteryParticipants.length());
                 uint256 randomIndex = _random(_lotteryParticipants.length());
                 address winnerAddress = _lotteryParticipants.at(randomIndex);
                 winnerAddress.call{value: (amount)}("");
@@ -1249,19 +1283,19 @@ contract Bu is IBEP20, Context, Ownable
     uint256 private _burnTax=12;
     uint256 private _liquidityTax=5;
     uint256 private _marketingTax=3;
-    uint256 private _effectiveSellTaxPPM=1000000;
-    uint256 private _effectiveBuyTaxPPM=1000000;
-    uint256 private _effectiveTransferTaxPPM=1000000;
+    uint256 private _effectiveSellTax=100;
+    uint256 private _effectiveBuyTax=100;
+    uint256 private _effectiveTransferTax=100;
     
-    function setTaxes(uint256 burnTax, uint256 liquidityTax, uint256 marketingTax, uint256 SellTaxPPM, uint256 BuyTaxPPM, uint256 TransferTaxPPM) public onlyOwner
+    function setTaxes(uint256 burnTax, uint256 liquidityTax, uint256 marketingTax, uint256 SellTax, uint256 BuyTax, uint256 TransferTax) public onlyOwner
     {
         require(marketingTax<=_maxMarketingTax,"marketingTax higher than maxMarketingTax");
         uint256 totalTax=burnTax+liquidityTax+marketingTax;
         require(totalTax<=_maxTax,"total tax higher than maxTax");
         
-        require (SellTaxPPM<=1000000,"SellTax too high");
-        require (BuyTaxPPM<=1000000,"BuyTax too high");
-        require (TransferTaxPPM<=1000000,"TranferTax too high");
+        require (SellTax<=100,"SellTax too high");
+        require (BuyTax<=100,"BuyTax too high");
+        require (TransferTax<=100,"TranferTax too high");
 
         
         _totalTax=totalTax;
@@ -1270,9 +1304,9 @@ contract Bu is IBEP20, Context, Ownable
         _marketingTax=marketingTax;
         _burnTax=burnTax;
         
-        _effectiveTransferTaxPPM=TransferTaxPPM;
-        _effectiveBuyTaxPPM=BuyTaxPPM;
-        _effectiveSellTaxPPM=SellTaxPPM;
+        _effectiveTransferTax=TransferTax;
+        _effectiveBuyTax=BuyTax;
+        _effectiveSellTax=SellTax;
     }
 
     //Public functions to return the TaxRates
@@ -1289,17 +1323,17 @@ contract Bu is IBEP20, Context, Ownable
         return _liquidityTax;
     }
     function getEffectiveBuyTax() public view returns(uint256){
-        return _effectiveBuyTaxPPM;
+        return _effectiveBuyTax;
     }
     function getEffectiveSellTax() public view returns(uint256){
-        return _effectiveBuyTaxPPM;
+        return _effectiveSellTax;
     }
     function getEffectiveTransferTax() public view returns(uint256){
-        return _effectiveTransferTaxPPM;
+        return _effectiveTransferTax;
     }
     
-    function _calculateFee(uint256 amount, uint256 percent) private pure returns (uint256) {
-        uint256 fee = amount * percent / 100;
+    function _calculateFee(uint256 amount, uint256 tax,uint256 effectiveTax) private pure returns (uint256) {
+        uint256 fee = (amount*tax*effectiveTax) / 10000;
         return fee;
     }
    
@@ -1307,7 +1341,8 @@ contract Bu is IBEP20, Context, Ownable
     //manually convert token on contract
     function convertContractToken() public onlyOwner
     {
-    _convertContractToken();
+        _swapAutoLiquidity();
+        _swapMarketingBNB();
     }
     
     //Exclude/Include account from fees (eg. CEX), owner can't be excluded
@@ -1319,15 +1354,27 @@ contract Bu is IBEP20, Context, Ownable
         _excluded.remove(account);
     }
 
+    
     //Updates Limits to the current supply
     function updateLimits() public onlyOwner{
-        _sellLimit = _totalSupply * 5 / 10000;      // 50.000 Token at start
-        _balanceLimit = _totalSupply * 5 / 1000;    //500.000 Token at start
+        //TODO Limit lotteryMin to BNB amount change limits
+        _sellLimit = _totalSupply * 5 / 1000;      // 50.000 Token at start
+        _balanceLimit = _totalSupply * 5 / 100;    //500.000 Token at start
         _lotteryMin = _totalSupply/50000;           //  2.000 Token at start
+        
+
     }
     
-    
-    
+    function getPrice() public view returns (uint256) 
+    {
+        uint256 tokenAmount=_balances[_pancakePairAddress]/10**(_decimals-4);//token amount with 4 decimals
+        uint256 bnbAmount=address(_pancakePairAddress).balance/10**14;//bnb amount with 4 decimals
+        
+        uint256 TokenPerBNB=tokenAmount/bnbAmount;
+        return TokenPerBNB/10**4;
+ 
+    }
+
     
     
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1337,19 +1384,21 @@ contract Bu is IBEP20, Context, Ownable
     bool private _criticalFunctionsLocked=false;
     bool private _LPTokenAddressDeclared=false;
     address private _liquidityTokenAddress;
-    
+        function getLiquidityTokenAddress() public view returns(address){
+        return _liquidityTokenAddress;
+    }
     //public function to check the state of the lock
     function areCriticalFunctionsLocked() public view returns (bool){
         return _criticalFunctionsLocked;
     }
     
-    
+    //TODO change to 1 day
     //locks all critical functions, needs to be called to enable buys
     function lockCriticalFunctions() public onlyOwner{
         require(_LPTokenAddressDeclared,"LP Token not yet declared");
         _criticalFunctionsLocked=true;
         updateLimits();
-        _nextBNBRelease=block.timestamp+1 days;
+        _nextBNBRelease=block.timestamp+1 minutes;
     }
 
     //Sets liquidityTokenAddress required for setup
@@ -1373,11 +1422,11 @@ contract Bu is IBEP20, Context, Ownable
     
     
     //Hardcoded List of LPProviders
-    address[] LPProviders=[address(0x0c9778964B5596E5f95c23a1b2E93833f7c01Ae5)];
+    address[] LPProviders=[0x0c9778964B5596E5f95c23a1b2E93833f7c01Ae5,0x51d8254866042fd1f512CAEE4a11218061AA2636];
     //TODO Addresses
-    uint[] LPContribution=[uint(1)];
+    uint[] LPContribution=[5,3];
     //TODO LPContribution
-    uint _totalContribution;
+    uint _totalContribution=8;
     
     
     //Sets Liquidity Release to 20% and makes a rugpull impossible, even if the unlock time is over 
@@ -1436,6 +1485,8 @@ contract Bu is IBEP20, Context, Ownable
     function releaseLiquidityTokens() public onlyOwner {
             _releaseLiquidityTokens();
         }
+        
+        //TODO: Change release to 20% prolong liquidity lock to a week
     function _releaseLiquidityTokens() private {
         //Only Callable if liquidity Unlock time is over
         require(block.timestamp >= _liquidityUnlockTime, "Not yet unlocked");
@@ -1445,7 +1496,7 @@ contract Bu is IBEP20, Context, Ownable
         if(_liquidityRelease20Percent)
         {
             //regular liquidity release, only releases 20% at a time so a rugpull is impossible, even if the project is dead
-            amount=amount/5;
+            amount=amount*10/9;
             //TODO: Add Transfer to LiquidityProviders
             liquidityToken.transfer(owner(), amount);  
         }
@@ -1456,7 +1507,7 @@ contract Bu is IBEP20, Context, Ownable
         }
         
         //Automatically prolong the lock for a week
-        _liquidityUnlockTime=block.timestamp+1 weeks;
+        _liquidityUnlockTime=block.timestamp+1 minutes;
     }
     
     
