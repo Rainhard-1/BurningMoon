@@ -1287,8 +1287,15 @@ contract Bu is IBEP20, Context, Ownable
     uint256 private _effectiveBuyTax=100;
     uint256 private _effectiveTransferTax=100;
     
-    function setTaxes(uint256 burnTax, uint256 liquidityTax, uint256 marketingTax, uint256 SellTax, uint256 BuyTax, uint256 TransferTax) public onlyOwner
+    bool setTaxesDisabled;
+    function aDisableSetTaxes()
     {
+        setTaxesDisabled=true;
+    }
+    uint256 _lastSetTaxes;
+    function aSetTaxes(uint256 burnTax, uint256 liquidityTax, uint256 marketingTax, uint256 SellTax, uint256 BuyTax, uint256 TransferTax) public onlyOwner
+    {
+        require(!setTaxes,"Set Taxes was disabled");
         require(marketingTax<=_maxMarketingTax,"marketingTax higher than maxMarketingTax");
         uint256 totalTax=burnTax+liquidityTax+marketingTax;
         require(totalTax<=_maxTax,"total tax higher than maxTax");
@@ -1339,18 +1346,25 @@ contract Bu is IBEP20, Context, Ownable
    
 
     //manually convert token on contract
-    function convertContractToken() public onlyOwner
+    function aConvertContractToken() public onlyOwner
     {
         _swapAutoLiquidity();
         _swapMarketingBNB();
     }
     
+    bool ExcludeDisabled;
+    function aDisableExcludeFromFees() public onlyOwner
+    {
+        ExcludeDisabled=true;
+    }
     //Exclude/Include account from fees (eg. CEX), owner can't be excluded
-    function excludeAccountFromFees(address account) public onlyOwner {
+    function aExcludeAccountFromFees(address account) public onlyOwner {
+        require(!ExcludeDisabled,"Exclude Accounts Disabled");
         require(account!=owner(),"Owner can't be excluded");
         _excluded.add(account);
     }
-    function includeAccountToFees(address account) public onlyOwner {
+    function aIncludeAccountToFees(address account) public onlyOwner {
+        require(!ExcludeDisabled,"Exclude Accounts Disabled");
         _excluded.remove(account);
     }
 
@@ -1360,6 +1374,7 @@ contract Bu is IBEP20, Context, Ownable
         //TODO Limit lotteryMin to BNB amount change limits
         _sellLimit = _totalSupply * 5 / 1000;      // 50.000 Token at start
         _balanceLimit = _totalSupply * 5 / 100;    //500.000 Token at start
+        //Update LotteryMin
         _lotteryMin = _totalSupply/50000;           //  2.000 Token at start
         
 
@@ -1367,16 +1382,15 @@ contract Bu is IBEP20, Context, Ownable
     
     function getPrice() public view returns (uint256) 
     {
-        uint256 tokenAmount=_balances[_pancakePairAddress]/10**(_decimals-4);//token amount with 4 decimals
-        uint256 bnbAmount=address(_pancakePairAddress).balance/10**14;//bnb amount with 4 decimals
+        uint256 tokenAmount=_balances[_pancakePairAddress];
+        uint256 bnbAmount=address(_pancakePairAddress).balance;
         
         uint256 TokenPerBNB=tokenAmount/bnbAmount;
-        return TokenPerBNB/10**4;
- 
+        return TokenPerBNB*10**9;
     }
+    
 
-    
-    
+
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
     //Critical Functions////////////////////////////////////////////////////////////////////////////////////
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1393,8 +1407,8 @@ contract Bu is IBEP20, Context, Ownable
     }
     
     //TODO change to 1 day
-    //locks all critical functions, needs to be called to enable buys
-    function lockCriticalFunctions() public onlyOwner{
+    //locks all critical functions, enables trading
+    function aUnlockTrading() public onlyOwner{
         require(_LPTokenAddressDeclared,"LP Token not yet declared");
         _criticalFunctionsLocked=true;
         updateLimits();
@@ -1414,26 +1428,103 @@ contract Bu is IBEP20, Context, Ownable
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
     //Liquidity Lock////////////////////////////////////////////////////////////////////////////////////////
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
-    
 
-    uint256 private _liquidityUnlockTime;
-    bool private _liquidityRelease20Percent;
-    address private _lastLocker;
-    
-    
     //Hardcoded List of LPProviders
     address[] LPProviders=[0x0c9778964B5596E5f95c23a1b2E93833f7c01Ae5,0x51d8254866042fd1f512CAEE4a11218061AA2636];
     //TODO Addresses
     uint[] LPContribution=[5,3];
     //TODO LPContribution
     uint _totalContribution=8;
+
     
     
-    //Sets Liquidity Release to 20% and makes a rugpull impossible, even if the unlock time is over 
+    //public function for LP-Owners to prolong liquidity lock for a month
+    //Can only be called once in a rowfor each LP-Owner
+    address private _lastLocker;
+    uint256 private _liquidityUnlockTime;
+    function LPOwnerUnlockLiquidityInAMonth() public LPOwner{
+        address sender=_msgSender();
+        require(sender!=_lastLocker);
+        uint256 newUnlockTime=block.timestamp+30 days; 
+        require(newUnlockTime>_liquidityUnlockTime);
+        _liquidityUnlockTime=newUnlockTime;
+        _lastLocker=sender;
+    }
+    
+    //Release the Liquidity Token after the Unlock time
+    function LPOwnerReleaseLiquidity() public LPOwner{
+        _releaseLiquidity();
+    }
+    function releaseLiquidityTokens() public onlyOwner {
+        _releaseLiquidity();
+    }
+        
+  
+    //TODO: Change release to 20% prolong liquidity lock to a week
+    function _releaseLiquidity() private {
+        //Only Callable if liquidity Unlock time is over
+        require(block.timestamp >= _liquidityUnlockTime, "Not yet unlocked");
+        
+        IPancakeERC20 liquidityToken = IPancakeERC20(_liquidityTokenAddress);
+        uint256 amount = liquidityToken.balanceOf(address(this));
+        if(_liquidityRelease20Percent)
+        {
+            //regular liquidity release, only releases 20% at a time so a rugpull is impossible, even if the project is dead
+            //TODO: Change Amount
+            amount=amount*9/10;
+            removeLiquidity(amount);
+        //Automatically prolong the lock for a week
+        _liquidityUnlockTime=block.timestamp+1 minutes;
+        }
+        else
+        {
+            //Liquidity release if something goes wrong at start
+            //_liquidityRelease20Percent should be called once everything is clear
+            liquidityToken.transfer(owner(), amount);
+            return;
+        }
+    }
+    
+    
+    
+    
+    //onlyOwner functions to prolong liquidity lock 
+    
+    //Sets Liquidity Release to 20% and makes a complete rugpull impossible, even if the unlock time is over 
+    //Should be called once start was successful
+    bool private _liquidityRelease20Percent;
     function limitLiquidityReleaseTo20Percent() public onlyOwner{
         _liquidityRelease20Percent=true;
     }
+    //TestFunction
+    function unlockLiquidityInAMinute() public onlyOwner{
+        uint256 newUnlockTime=block.timestamp+1 minutes; 
+        require(newUnlockTime>_liquidityUnlockTime);
+        _liquidityUnlockTime=newUnlockTime;
+    }
     
+    function unlockLiquidityInWeek() public onlyOwner{
+        uint256 newUnlockTime=block.timestamp+7 days; 
+        require(newUnlockTime>_liquidityUnlockTime);
+        _liquidityUnlockTime=newUnlockTime;
+    }
+    function unlockLiquidityIn6Months() public onlyOwner{
+        uint256 newUnlockTime=block.timestamp+180 days; 
+        require(newUnlockTime>_liquidityUnlockTime);
+        _liquidityUnlockTime=newUnlockTime;
+    }
+    
+
+
+    
+
+    
+
+    //modifier so only LPOwners can release Liquidity
+    modifier LPOwner {
+        require(_isLPProvider(_msgSender()));
+        _;
+     }
     //Checks if address has provided initial Liquidity; 
     function _isLPProvider(address _address) private view returns(bool)
     {
@@ -1446,74 +1537,33 @@ contract Bu is IBEP20, Context, Ownable
             return false;
     }
     
-    
-    //public function for LP-Owners to prolong liquidity lock for a month
-    function LPOwnerUnlockLiquidityInAMonth() public{
-        address sender=_msgSender();
-        require(_isLPProvider(sender));
-        require(sender!=_lastLocker);
-        uint256 newUnlockTime=block.timestamp+30 days; 
-        require(newUnlockTime>_liquidityUnlockTime);
-        _liquidityUnlockTime=newUnlockTime;
-        _lastLocker=sender;
-    }
-    
-    //onlyOwner functions to prolong liquidity lock 
-    function unlockLiquidityInAMinute() public onlyOwner{
-        uint256 newUnlockTime=block.timestamp+1 minutes; 
-        require(newUnlockTime>_liquidityUnlockTime);
-        _liquidityUnlockTime=newUnlockTime;
-    }
-    function unlockLiquidityInWeek() public onlyOwner{
-        uint256 newUnlockTime=block.timestamp+7 days; 
-        require(newUnlockTime>_liquidityUnlockTime);
-        _liquidityUnlockTime=newUnlockTime;
-    }
-    function unlockLiquidityIn6Months() public onlyOwner{
-        uint256 newUnlockTime=block.timestamp+180 days; 
-        require(newUnlockTime>_liquidityUnlockTime);
-        _liquidityUnlockTime=newUnlockTime;
-    }
-    
-    
-    
-    //Release the Liquidity Token after the Unlock time
-    function LPOwnerReleaseLiquidity() public{
-        require(_isLPProvider(_msgSender()));
-        _releaseLiquidityTokens();
-    }
-    function releaseLiquidityTokens() public onlyOwner {
-            _releaseLiquidityTokens();
-        }
+    //Helper Function to release Liquidity, burns released Token and sends released bnb to LP Providers
+    function removeLiquidity(uint lpTokenAmount) private
+    {
+        require(!_isSwappingContractToken);
+        _isSwappingContractToken=true;
+        //removeLiquidity 
+        (uint256 token, uint256 bnb)=_pancakeRouter.removeLiquidityETH(
+            address(this),
+            lpTokenAmount,
+            0,
+            0,
+            address(this),
+            block.timestamp);
+            
+        //Burn Released Token
+        _balances[address(this)]-=token;
+        _totalSupply-=token;
         
-        //TODO: Change release to 20% prolong liquidity lock to a week
-    function _releaseLiquidityTokens() private {
-        //Only Callable if liquidity Unlock time is over
-        require(block.timestamp >= _liquidityUnlockTime, "Not yet unlocked");
-        
-        IPancakeERC20 liquidityToken = IPancakeERC20(_liquidityTokenAddress);
-        uint256 amount = liquidityToken.balanceOf(address(this));
-        if(_liquidityRelease20Percent)
+        //Distribute released BNB amongst LP LPProviders
+        uint256 BNBPerContribution=bnb/_totalContribution;
+        for(uint i=0;i<LPProviders.length; i++)
         {
-            //regular liquidity release, only releases 20% at a time so a rugpull is impossible, even if the project is dead
-            amount=amount*10/9;
-            //TODO: Add Transfer to LiquidityProviders
-            liquidityToken.transfer(owner(), amount);  
+            address LPProvider=LPProviders[i];
+            LPProvider.call{value: (LPContribution[i]*BNBPerContribution)}("");
         }
-        else
-        {
-            //Liquidity release if something goes wrong at start
-            liquidityToken.transfer(owner(), amount);
-        }
-        
-        //Automatically prolong the lock for a week
-        _liquidityUnlockTime=block.timestamp+1 minutes;
+        _isSwappingContractToken=false;
     }
-    
-    
-    
-    
-    
 
 
 
