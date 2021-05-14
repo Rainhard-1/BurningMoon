@@ -2,7 +2,7 @@
  Burning Moon
 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
- Please Read Carefully
+ Please Read carefully before doing a Rugscreen 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -49,10 +49,6 @@ Donations:
     Each week the whole marketing wallet automatically gets donated to a charity wallet.
     Our goal is to burn the Moon, but keep the Earth cool.
 
-Lottery:
-    Once a week a winner gets drawn out of all the wallets that bought a minimum amount, 
-    only buying makes a wallet eligible for a lottery ticket, not transfering.
-    Selling burns the Lottery ticket, so you have to buy again to be eligible.
 
 
 Whale Protection:
@@ -67,7 +63,7 @@ Dump Protection:
 
 // SPDX-License-Identifier: MIT
 
-pragma solidity ^0.8.4;
+pragma solidity ^0.7.4;
 
 interface IBEP20 {
   function totalSupply() external view returns (uint256);
@@ -87,7 +83,7 @@ interface IBEP20 {
 
 
 
-pragma solidity ^0.8.4;
+pragma solidity ^0.7.4;
 
 interface IPancakeERC20 {
     event Approval(address indexed owner, address indexed spender, uint value);
@@ -259,7 +255,7 @@ interface IPancakeRouter02 is IPancakeRouter01 {
 
 
 
-pragma solidity ^0.8.4;
+pragma solidity ^0.7.4;
 
 /*
  * @dev Provides information about the current execution context, including the
@@ -286,7 +282,7 @@ abstract contract Context {
 
 
 
-pragma solidity ^0.8.4;
+pragma solidity ^0.7.4;
 
 /**
  * @dev Contract module which provides a basic access control mechanism, where
@@ -377,7 +373,7 @@ abstract contract Ownable is Context {
 
 
 
-pragma solidity ^0.8.4;
+pragma solidity ^0.7.4;
 
 /**
  * @dev Collection of functions related to the address type
@@ -574,7 +570,7 @@ library Address {
 
 
 
-pragma solidity ^0.8.3;
+pragma solidity ^0.7.3;
 
 /**
  * @dev Library for managing
@@ -881,8 +877,8 @@ library EnumerableSet {
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 //Burning Moon Contract ////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
-pragma solidity ^0.8.4;
-contract Bu is IBEP20, Context, Ownable
+pragma solidity ^0.7.4;
+contract Bu2 is IBEP20, Context, Ownable
 {
     using Address for address;
     using EnumerableSet for EnumerableSet.AddressSet;
@@ -893,15 +889,14 @@ contract Bu is IBEP20, Context, Ownable
     mapping (address => uint256) private _sellLock;
     EnumerableSet.AddressSet private _excluded;
     EnumerableSet.AddressSet private _whiteList;
-    EnumerableSet.AddressSet private _lotteryParticipants;
     
     IPancakeRouter02 private _pancakeRouter;
     event SwapAutoLiquidity(uint256 tokens, uint256 bnb);
     event Burn(uint256 amount);
 
     //Token Info
-    string private _name = 'TeBu';
-    string private _symbol = 'Bu';
+    string private _name = 'TeBu2';
+    string private _symbol = 'Bu2';
     uint8 private _decimals = 9;
     //equals 100.000.000 token
     uint256 private _totalSupply = 100 * 10**6 * 10**9;
@@ -909,7 +904,6 @@ contract Bu is IBEP20, Context, Ownable
     //variables that track balanceLimit and sellLimit, get updated based on remaining supply, once contract gets locked or manually 
     uint256 private  _balanceLimit = _totalSupply;
     uint256 private  _sellLimit = _totalSupply;
-    uint256 private _lotteryMin=_totalSupply;
 
     //Sellers get locked for 2 hours so they can't dump repeatedly
     //TODO change SellLock
@@ -963,8 +957,8 @@ contract Bu is IBEP20, Context, Ownable
     //Main transfer function, all transfers run through this function
     function _transfer(address sender, address recipient, uint256 amount) private
     {
-        require(sender != address(0), "Transfer from zero address");
-        require(recipient != address(0), "Transfer to zero address");
+        require(sender != address(0), "Transfer from zero");
+        require(recipient != address(0), "Transfer to zero");
 
         //Manually Excluded adresses are transfering tax and lock free
         bool isExcluded = _excluded.contains(sender) || _excluded.contains(recipient);
@@ -996,38 +990,30 @@ contract Bu is IBEP20, Context, Ownable
         }
         else
         {
-                //trading needs to be enabled to trade
+            //trading needs to be enabled to trade
             if(_tradingEnabled)
             {
                 _taxedTransfer(sender,recipient,amount,isBuy,isSell);
             }
             else
             {
-                _whitelistTransfer(sender, recipient, amount, isBuy, isSell);
-            }
-
-        }
-    }
-    function _whitelistTransfer(address sender, address recipient, uint256 amount,bool isBuy,bool isSell) private
-    {
-                //if trading isn't enabled check if whitelist is enabled
-                require(_whiteListTradingEnabled,"Whitelist Trading not enabled yet");
-
-                //if whitelist trading time is over, enable normal trading
-                if(block.timestamp>_whiteListTradingTime)
+                if(block.timestamp<_whiteListTradingTime)
                 {
-                    _tradingEnabled=true;
-                    _taxedTransfer(sender, recipient, amount, isBuy, isSell);
+                    require(isBuy,"Only Buys on whitelist");
+                    require(_balances[recipient]+amount<100000,"Balance Limit 100.000");
+                    _taxedTransfer(sender,recipient,amount,isBuy,isSell);
+                    return;
                 }
                 else
                 {
-                    //checks if recipient is on whitelist and if buy is below 0.1%
-                    require(isBuy,"Only Buys are allowed on Whitelist");
-                    require(_whiteList.contains(recipient),"recipient not on whitelist");
-                    require(_balances[recipient]+amount<100000,"max Whitelist Wallet size is 0.1%");
-                    _taxedTransfer(sender, recipient, amount, true, false);
+                    require(_whiteListTradingTime>0);                
+                    _tradingEnabled=true;
+                    _taxedTransfer(sender,recipient,amount,isBuy,isSell);   
                 }
 
+
+            }
+        }
     }
     
     //Owner transfers feeless and can't sell
@@ -1051,7 +1037,7 @@ contract Bu is IBEP20, Context, Ownable
     {
         uint256 recipientBalance = _balances[recipient];
         uint256 senderBalance = _balances[sender];
-        require(senderBalance >= amount, "Transfer amount exceeds balance");
+        require(senderBalance >= amount, "Transfer exceeds balance");
 
         uint256 tax=100;
         if(isSell)
@@ -1059,9 +1045,7 @@ contract Bu is IBEP20, Context, Ownable
             //When the last Sell is less than the sellLockTime ago, sells are disabled
             require(_sellLock[sender]<=block.timestamp,"Seller in sellLock");
             //Sells can't exceed the sell limit(50.000 Tokens at start)
-            require(amount<=_sellLimit,"Dump protection engaged, transfer declined");
-            //All sells remove seller from the lottery pot
-            _lotteryParticipants.remove(sender); 
+            require(amount<=_sellLimit,"Dump protection");
             //Add Sell Lock for sellers
             _sellLock[sender]=block.timestamp+_sellLockTime;
             //Sets tax% to the sellTax
@@ -1072,15 +1056,11 @@ contract Bu is IBEP20, Context, Ownable
             //Require the final balance(excluding Taxes) to be less than the balance Limit.
             //That means you can buy a maximum of 500.000 Token at Start and recieve 400.000 Token at 20% tax
             //After that you can buy 100.000 Token and so on 
-            require(recipientBalance+amount<=_balanceLimit,"whale protection engaged, transfer declined");
+            require(recipientBalance+amount<=_balanceLimit,"whale protection");
 
             if(isBuy)
             {
-                //Buys above the min lottery treshold add the buyer to the lottery pot
-                if(amount>=_lotteryMin)
-                {
-                    _lotteryParticipants.add(recipient); 
-                }
+
                 //Sets tax% to the buyTax
                 tax=_effectiveBuyTax;
             }
@@ -1108,7 +1088,7 @@ contract Bu is IBEP20, Context, Ownable
         }
         else
         {
-            //Handle the release of marketing BNB to Multisig Wallet, Donation Wallet or Lottery
+            //Handle the release of marketing BNB to Multisig Wallet, Donation Wallet
             _handleBNBRelease();    
         }
 
@@ -1143,7 +1123,7 @@ contract Bu is IBEP20, Context, Ownable
     {
 
         uint256 senderBalance = _balances[sender];
-        require(senderBalance >= amount, "Transfer amount exceeds balance");
+        require(senderBalance >= amount, "Transfer exceeds balance");
         _balances[sender]=senderBalance-amount;
         _balances[recipient]+=amount;
 
@@ -1195,11 +1175,6 @@ contract Bu is IBEP20, Context, Ownable
         _swapTokenForBNB(token);
         _isSwappingContractToken=false;
     }
-    
-    
-    
- 
-
     //helper function to swap tokens on contract address to BNB
     function _swapTokenForBNB(uint256 amount) private {
         _approve(address(this), address(_pancakeRouter), amount);
@@ -1232,8 +1207,6 @@ contract Bu is IBEP20, Context, Ownable
 
 
 
-    
-    
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
     //Functions to handle MarketingBNB//////////////////////////////////////////////////////////////////////
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1256,7 +1229,7 @@ contract Bu is IBEP20, Context, Ownable
     //Active marketingWallet
     
         //List of availavle marketingWallets
-    address _defaultMarketingWallet=0x0c9778964B5596E5f95c23a1b2E93833f7c01Ae5;
+    address _defaultMarketingWallet=0xb1719703eBE28d27eD38c81429724160B2aCeb8B;
     address private _marketingWallet;
     
     
@@ -1287,16 +1260,11 @@ contract Bu is IBEP20, Context, Ownable
     function aSwitchManualRelease(bool manualRelease) public onlyOwner{
         _manualRelease=manualRelease;
     }
-    
     function aSwitchManualContractTokenConversion(bool manualConversion) public onlyOwner{
         _manualConversion=manualConversion;
     }
     function aManualBNBRelease() public onlyOwner{
         _releaseBNB();
-    }
-    bool _lotteryDisabled;
-    function aDisableLottery(bool disable) public onlyOwner{
-        _lotteryDisabled=disable;
     }
 
 
@@ -1316,36 +1284,19 @@ contract Bu is IBEP20, Context, Ownable
         }
         uint256 amount=address(this).balance;
         
-        if(_releaseDay<=4)
-        {
-            //releaseMarketingBNB
-            _releaseMarketingBNB(amount);
-            _releaseDay++;
-        }
-        else if(_releaseDay==5)
+        _releaseDay++;
+        if(_releaseDay>=7)
         {
             //donate
             _donateBNB(amount);
-            _releaseDay++;
-        }
-        else if(_releaseDay==6)
-        {
-            //Lottery
             _releaseDay=0;
-            if(_lotteryDisabled)
-            {
-                _releaseBNB();
-                return;
-            }
-            _drawLotteryWinner(amount);
-
         }
         else
         {
-            //If someting unexpected happens set day to 0;
-            _releaseDay=0;
+            //releaseMarketingBNB
+            _releaseMarketingBNB(amount);
         }
-        _nextBNBRelease=_nextBNBRelease+1 days;
+        _nextBNBRelease=_nextBNBRelease+_releaseFrequency;
     }
     
     //Transfer to Marketing Wallet
@@ -1357,32 +1308,6 @@ contract Bu is IBEP20, Context, Ownable
     function _donateBNB(uint256 amount) private {
        _donationWallet.call{value: (amount)}("");
     }
-    
-    //helper function to get random Number
-    function _random(uint256 limit) private view returns (uint256) {
-        uint256 random = uint256(keccak256(abi.encodePacked(block.difficulty, block.timestamp))) % limit;
-        return random;
-    }
-    
-    address private _lastLotteryWinner;
-    uint256 _lastLotteryParticipants;
-    //Randomly picks Lottery winner according to lottery rules
-    function _drawLotteryWinner(uint256 amount) private{
-        if (amount!=0&&_lotteryParticipants.length()>0) {
-                uint256 randomIndex = _random(_lotteryParticipants.length());
-                address winnerAddress = _lotteryParticipants.at(randomIndex);
-                winnerAddress.call{value: (amount)
-                }("");
-                _lastLotteryWinner=winnerAddress;
-        }
-    }
-    function getLastLotteryWinner() public view returns (address){
-        return _lastLotteryWinner;
-    }
-    function getLotteryParticipants() public view returns (uint256){
-        return _lotteryParticipants.length();
-    }
-    
 
     
     
@@ -1399,11 +1324,6 @@ contract Bu is IBEP20, Context, Ownable
     uint256 private _effectiveBuyTax=100;
     uint256 private _effectiveTransferTax=100;
     
-    function aAddToWhitelist(address addressToAdd) public onlyOwner
-    {
-        _whiteList.add(addressToAdd);
-    }
-
     //Disables the owner from changing taxes ever again
     bool _setTaxesDisabled;
     function aDisableSetTaxes() public onlyOwner()
@@ -1481,35 +1401,22 @@ contract Bu is IBEP20, Context, Ownable
     }
     //Exclude/Include account from fees (eg. CEX), owner can't be excluded
     function aExcludeAccountFromFees(address account) public onlyOwner {
-        require(!ExcludeDisabled,"Exclude Accounts Disabled");
-        require(account!=owner(),"Owner can't be excluded");
+        require(!ExcludeDisabled);
+        require(account!=owner());
         _excluded.add(account);
     }
     function aIncludeAccountToFees(address account) public onlyOwner {
-        require(!ExcludeDisabled,"Exclude Accounts Disabled");
+        require(!ExcludeDisabled);
         _excluded.remove(account);
     }
 
-
+    
     //Updates Limits to the current supply
-    function updateLimits() public onlyOwner{
-        //TODO Limit lotteryMin to BNB amount change limits
+    function aUpdateLimits() public onlyOwner{
         _sellLimit = _totalSupply * 5 / 1000;      // 50.000 Token at start
         _balanceLimit = _totalSupply * 5 / 100;    //500.000 Token at start
-        //Update LotteryMin
-        _lotteryMin = _totalSupply/50000;           //  2.000 Token at start
-        
-
     }
     
-    function getPrice() public view returns (uint256) 
-    {
-        uint256 tokenAmount=_balances[_pancakePairAddress];
-        uint256 bnbAmount=address(_pancakePairAddress).balance;
-        
-        uint256 TokenPerBNB=tokenAmount/bnbAmount;
-        return TokenPerBNB*10**9;
-    }
     
 
 
@@ -1520,40 +1427,39 @@ contract Bu is IBEP20, Context, Ownable
     bool private _criticalFunctionsLocked=false;
     bool private _LPTokenAddressDeclared=false;
     address private _liquidityTokenAddress;
-        function getLiquidityTokenAddress() public view returns(address){
+    function getLiquidityTokenAddress() public view returns(address){
         return _liquidityTokenAddress;
     }
     //public function to check the state of the lock
     function areCriticalFunctionsLocked() public view returns (bool){
         return _criticalFunctionsLocked;
     }
-    
-    //TODO change to 1 day
-    uint256 _whiteListTradingTime;
-    bool _whiteListTradingEnabled;
     bool _tradingEnabled;
 
-    //Unlocks Buying for accounts on the Whitelist, locks critical functions
-    //Enables Trading in 30 min
-    function aUnlockWhitelistTrading() public onlyOwner{
-        require(!_whiteListTradingEnabled,"Whitelist already Enabled");
-        require(!_tradingEnabled,"Trading already Enabled");
-
-        require(_LPTokenAddressDeclared,"LP Token not yet declared");
-        _criticalFunctionsLocked=true;
-        updateLimits();
-
-        _whiteListTradingEnabled=true;
-        _whiteListTradingTime=block.timestamp+30 minutes;
-        _nextBNBRelease=block.timestamp+1 minutes;
+    //TODO change release to 1 day and unlock time to 7 days
+    uint256 _whiteListTradingTime;
+    function aUnlockTrading() public onlyOwner{
+        require(_liquidityTokenAddress!=address(0),"LP Token not yet declared");
+        require(_whiteListTradingTime==0,"Trading already Enabled");
+        aUpdateLimits();      
+        _whiteListTradingTime=block.timestamp+5 minutes;
+        _nextBNBRelease=block.timestamp+10 minutes;
+        _liquidityUnlockTime=block.timestamp+7 minutes;
     }
 
-
-
+    function aAddToWhitelist(address addressToAdd) public onlyOwner{
+        _whiteList.add(addressToAdd);
+    }
+    function aAddArrayToWhitelist(address[] memory addressesToAdd) public onlyOwner{
+        for(uint i=0; i<addressesToAdd.length; i++)
+        {
+            _whiteList.add(addressesToAdd[i]);
+        }
+    }
+    
     //Sets liquidityTokenAddress required for setup
-    function SetupLiquidityTokenAddress(address liquidityTokenAddress) public onlyOwner{
-        require(!_criticalFunctionsLocked,"This function is locked forever");
-        _LPTokenAddressDeclared=true;
+    function aSetupLiquidityTokenAddress(address liquidityTokenAddress) public onlyOwner{
+        require(!_tradingEnabled,"This function is locked forever");
         _liquidityTokenAddress=liquidityTokenAddress;
     }
     
@@ -1565,16 +1471,16 @@ contract Bu is IBEP20, Context, Ownable
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
 
     //Hardcoded List of LPProviders
-    address[] LPProviders=[0x0c9778964B5596E5f95c23a1b2E93833f7c01Ae5,0x51d8254866042fd1f512CAEE4a11218061AA2636];
+    address[] LPProviders=[0x0c9778964B5596E5f95c23a1b2E93833f7c01Ae5,0x51d8254866042fd1f512CAEE4a11218061AA2636,0xb1719703eBE28d27eD38c81429724160B2aCeb8B];
     //TODO Addresses
-    uint[] LPContribution=[5,3];
+    uint[] LPContribution=[2,2,20];
     //TODO LPContribution
-    uint _totalContribution=8;
+    uint _totalContribution=24;
 
     
     
     //public function for LP-Owners to prolong liquidity lock for a month
-    //Can only be called once in a rowfor each LP-Owner
+    //Can only be called once in a row for each LP-Owner
     address private _lastLocker;
     uint256 private _liquidityUnlockTime;
     function LPOwnerUnlockLiquidityInAMonth() public LPOwner{
@@ -1673,10 +1579,11 @@ contract Bu is IBEP20, Context, Ownable
     }
     
     //Helper Function to release Liquidity, burns released Token and sends released bnb to LP Providers
-    function removeLiquidity(uint lpTokenAmount) private
+    function removeLiquidity(uint lpTokenAmount) private lockTheSwap
     {
         require(!_isSwappingContractToken);
         _isSwappingContractToken=true;
+        _approve(address(this), address(_pancakeRouter), lpTokenAmount);
         //removeLiquidity 
         (uint256 token, uint256 bnb)=_pancakeRouter.removeLiquidityETH(
             address(this),
@@ -1749,8 +1656,8 @@ contract Bu is IBEP20, Context, Ownable
         return true;
     }
     function _approve(address owner, address spender, uint256 amount) private {
-        require(owner != address(0), "Approve from the zero address");
-        require(spender != address(0), "Approve to the zero address");
+        require(owner != address(0), "Approve from zero");
+        require(spender != address(0), "Approve to zero");
 
         _allowances[owner][spender] = amount;
         emit Approval(owner, spender, amount);
@@ -1760,7 +1667,7 @@ contract Bu is IBEP20, Context, Ownable
         _transfer(sender, recipient, amount);
 
         uint256 currentAllowance = _allowances[sender][_msgSender()];
-        require(currentAllowance >= amount, "Transfer amount exceeds allowance");
+        require(currentAllowance >= amount, "Transfer > allowance");
 
         _approve(sender, _msgSender(), currentAllowance - amount);
         return true;
@@ -1775,7 +1682,7 @@ contract Bu is IBEP20, Context, Ownable
 
     function decreaseAllowance(address spender, uint256 subtractedValue) external returns (bool) {
         uint256 currentAllowance = _allowances[_msgSender()][spender];
-        require(currentAllowance >= subtractedValue, "Decreased allowance below zero");
+        require(currentAllowance >= subtractedValue, "<0 allowance");
 
         _approve(_msgSender(), spender, currentAllowance - subtractedValue);
         return true;
