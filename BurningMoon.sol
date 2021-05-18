@@ -903,6 +903,7 @@ contract Bu2 is IBEP20, Context, Ownable
     uint8 private _decimals = 9;
     //equals 100.000.000 token
     uint256 private _totalSupply = 100 * 10**6 * 10**9;
+    uint256 private _initialSupply;
     
     //variables that track balanceLimit and sellLimit, get updated based on remaining supply, once contract gets locked or manually 
     uint256 private  _balanceLimit = _totalSupply;
@@ -936,11 +937,15 @@ contract Bu2 is IBEP20, Context, Ownable
         _isSwappingContractModifier = false;
     }
     //modifier for functions only the team can call
+    
+    
     modifier onlyTeam() {
-        require(owner() == _msgSender()||_teamWallet==_msgSender(), "Caller not in Team");
+        require(_isTeam(_msgSender()), "Caller not in Team");
         _;
     }
-    
+    function _isTeam(address addr) private view returns (bool){
+        return addr==owner()||addr==_teamWallet;
+    }
     
 
 
@@ -952,13 +957,12 @@ contract Bu2 is IBEP20, Context, Ownable
         _pancakeRouter = IPancakeRouter02(0x10ED43C718714eb63d5aA57B78B54704E256024E);
         //Creates a Pancake Pair
         _pancakePairAddress = IPancakeFactory(_pancakeRouter.factory()).createPair(address(this), _pancakeRouter.WETH());
-
+        TeamUpdateLimits();
         //Sets the Marketing and donation address to the default address
-        
-    _donationWallet=_donationWallets[0];
-    _marketingWallet=_teamWallet;
-    //Set default taxes to 5 Burn, 10 Liquidity, 5 Marketing;
-    _setTaxes(5,10,5,true,true,true);
+        _initialSupply=_totalSupply;
+        _marketingWallet=_teamWallet;
+        //Set default taxes to 5 Burn, 10 Liquidity, 5 Marketing;
+        _setTaxes(5,10,5,true,true,true);
     }
 
 
@@ -988,21 +992,18 @@ contract Bu2 is IBEP20, Context, Ownable
         || (recipient == _pancakePairAddress && sender == pancakeRouter);
 
         //owner transfers feeless and can't sell
-        bool isOwnerTransfer=(sender==owner()||recipient==owner());
+        bool isTeamTransfer=(_isTeam(sender)||_isTeam(recipient));
 
         //differentiate between buy/sell/transfer to apply different taxes/restrictions
         bool isBuy=sender==_pancakePairAddress|| sender == pancakeRouter;
         bool isSell=recipient==_pancakePairAddress|| recipient == pancakeRouter;
 
 
-        if(isContractTransfer||isLiquidityTransfer||isExcluded
+        if(isContractTransfer||isLiquidityTransfer
+        ||isExcluded||isTeamTransfer
         ||_isSwappingContractToken||_isSwappingContractModifier)
         {
             _feelessTransfer(sender, recipient, amount);
-        }
-        else if(isOwnerTransfer)
-        {
-            _ownerTransfer(sender, recipient, amount, isSell);
         }
         else
         { 
@@ -1071,7 +1072,7 @@ contract Bu2 is IBEP20, Context, Ownable
             //sell taxed token for BNB and leave them in the Contract Wallet to be distributed later
             _swapMarketingBNB();
         }
-        else
+        else if(_autoRelease)
         {
             //Checks if marketing BNB should be released
             _autoReleaseMarketingBNB();
@@ -1107,23 +1108,8 @@ contract Bu2 is IBEP20, Context, Ownable
     uint256 amount,bool isBuy,bool isSell) private{
         require(_whiteList.contains(recipient),"recipient not on whitelist");    
         require(_balances[recipient]+amount<=_balanceLimit/5,"Whitelist Limit is 1/5 of regular Limit");
-        
         _taxedTransfer(sender,recipient,amount,isBuy,isSell);
 
-    }
-    
-    //Owner transfers feeless and can't sell
-    function _ownerTransfer(address sender, address recipient, uint256 amount,bool sell) private
-    {
-        if(!_tradingEnabled)
-        {
-            _feelessTransfer(sender, recipient, amount);
-        }
-        else
-        {
-            require(!sell);
-            _feelessTransfer(sender, recipient, amount);
-        }
     }
     
     function _feelessTransfer(address sender, address recipient, uint256 amount) private
@@ -1146,13 +1132,21 @@ contract Bu2 is IBEP20, Context, Ownable
         _isSwappingContractToken=true;
         
         //make sure to swap less tokens than balance
-        uint256 token=_liquidityBalance;
-        _liquidityBalance=0;
-        uint256 _tokenBalance=_balances[address(this)];
-        if(token>_tokenBalance)
+        uint256 tokenBalance=_balances[address(this)];
+        if(_liquidityBalance>tokenBalance)
         {
-            token=_tokenBalance;
+            _liquidityBalance=tokenBalance;
         }
+        
+        uint256 token=_liquidityBalance;
+        
+        //make sure the amount to be sold doesn't exceed the sellLimit
+        if(token>_sellLimit*2){
+            token=_sellLimit*2;
+        }
+        _liquidityBalance-=token;
+
+
         //split token in 2 halves
         uint256 half = token / 2;
         uint256 otherHalf=token-half;
@@ -1168,15 +1162,18 @@ contract Bu2 is IBEP20, Context, Ownable
     }
     function _swapMarketingBNB() private lockTheSwap{
         _isSwappingContractToken=true;
-    
-        //make sure to swap less tokens than balance
-        uint256 token=_marketingBalance;
-        _marketingBalance=0;
-        uint256 _tokenBalance=_balances[address(this)];
-        if(token>_tokenBalance)
-        {
-            token=_tokenBalance;
+        //make sure that the token amount doesnt exeed balance
+        uint256 tokenBalance=_balances[address(this)];
+        if(_marketingBalance>tokenBalance){
+            _marketingBalance=tokenBalance;
         }
+        
+        uint256 token=_marketingBalance;
+        //make sure the amount to be sold doesn't exceed the sellLimit
+        if(token>_sellLimit){
+            token=_sellLimit;
+        }
+        _marketingBalance-=token;
         //Do The Swap
         _swapTokenForBNB(token);
         _isSwappingContractToken=false;
@@ -1220,100 +1217,56 @@ contract Bu2 is IBEP20, Context, Ownable
     //TODO: Change Marketing Wallets, Donation Wallets, and _releaseFrequency
     //How often should the marketing BNB be released
     uint256 constant _releaseFrequency=2 minutes;
-    uint256 private _nextBNBRelease;
 
     bool private _manualConversion;
-    bool private _manualRelease;
-    bool private _useDonationInsteadOfMarketing;
-    
-    //List of availavle donationWallets
-    address[] private _donationWallets=[0x0c9778964B5596E5f95c23a1b2E93833f7c01Ae5,0x51d8254866042fd1f512CAEE4a11218061AA2636];
-    //Active donationWallet
-    address private _donationWallet;
+    bool private _autoRelease;
 
     //The Team Wallet is a Multisig wallet that reqires 3 signatures for each action
     address private constant _teamWallet=0xb1719703eBE28d27eD38c81429724160B2aCeb8B;
     address private _marketingWallet;
     
-    
-    
-
-    function TeamSetStaking(address stakingContract, uint stakingPercentage) public onlyTeam
+    function TeamSetMarketingWallet(address marketingWallet) public onlyTeam
     {
-        require(stakingPercentage<=100);
-        _stakingContract=stakingContract;
-        _stakingPercentage=stakingPercentage;
-    }
-    function TeamSwitchToDonateMarketingWallet(bool useDonationWallet) public onlyTeam{
-        _useDonationInsteadOfMarketing=useDonationWallet;
-        if(useDonationWallet)
-        {
-            _marketingWallet=_donationWallet;
-        }
-        else
-        {
-            _marketingWallet=_teamWallet;
-        }
-    }
-    
-    function TeamSetDonationAddress(uint ID) public onlyTeam{
-        require(ID<_donationWallets.length,"DonationAdresses doesnt exist");
-        _donationWallet=_donationWallets[ID];
-        if(_useDonationInsteadOfMarketing)
-        {
-            _marketingWallet=_donationWallet;
-        }
+        _marketingWallet=marketingWallet;    
     }
     
     function TeamSwitchManualBNBConversion(bool manualConversion) public onlyTeam{
         _manualConversion=manualConversion;
     }
-    
-    function TeamSwitchManualBNBRelease(bool manualRelease) public onlyTeam{
-        _manualRelease=manualRelease;
+    function TeamSwitchAutoBNBRelease(bool autoRelease) public onlyTeam{
+        _autoRelease=autoRelease;
     }
     function TeamReleaseBNB() public onlyTeam{
         _releaseBNB();
     }
 
-
-
     function _autoReleaseMarketingBNB() private{
-        if(_nextBNBRelease<=block.timestamp&&!_manualRelease){
+        uint256 BNBBalance = address(this).balance;
+        //if BNB balance is more than 10 bnb release
+        if(BNBBalance>10*10**18)
         _releaseBNB();
-        _nextBNBRelease=block.timestamp+_releaseFrequency;
-        }
-
     }
-
     function _releaseBNB() private{
         uint256 amount=address(this).balance;
-        uint256 donateAmount=amount/7;
-        amount-=donateAmount;
         _releaseMarketingBNB(amount);
-        _donateBNB(donateAmount);
     }
     
-    address _stakingContract;
-    uint _stakingPercentage;
+    bool private _callFailed;
     function _releaseMarketingBNB(uint256 amount) private {
-        
-        //enables to redirect a percentage of the marketing tax to a staking contract
-        if(_stakingPercentage>0&&_stakingContract!=address(0))
-        {
-            uint256 stakeAmount=amount*_stakingPercentage/100;
-            amount-=stakeAmount;
-            _stakingContract.call{value: (stakeAmount)}("");
+        if(amount==0){
+            return;
         }
-        
-        _marketingWallet.call{value: (amount)}("");
-        
+        (bool Sent,) =_marketingWallet.call{value: (amount)}("");
+        if(!Sent){
+        _callFailed=true;
+        }
     }
+    function ReleaseIssuesRecorded() public view returns (bool)
+    {
+        return _callFailed;
+    }
+
     
-    //Donate to Donation Address
-    function _donateBNB(uint256 amount) private {
-       _donationWallet.call{value: (amount)}("");
-    }
 
     
     
@@ -1340,9 +1293,8 @@ contract Bu2 is IBEP20, Context, Ownable
         _swapMarketingBNB();
     }
     
-    //Exclude/Include account from fees (eg. CEX), owner can't be excluded
+    //Exclude/Include account from fees (eg. CEX)
     function TeamExcludeAccountFromFees(address account) public onlyTeam {
-        require(account!=owner());
         _excluded.add(account);
     }
     function TeamIncludeAccountToFees(address account) public onlyTeam {
@@ -1352,9 +1304,10 @@ contract Bu2 is IBEP20, Context, Ownable
     
     //Updates Limits to the current supply
     function TeamUpdateLimits() public onlyTeam{
-        //TODO CHange  limits
-        _sellLimit = _totalSupply * 5 / 1000;      // 50.000 Token at start
-        _balanceLimit = _totalSupply * 5 / 100;    //500.000 Token at start
+        
+        _balanceLimit = _totalSupply*5/100;           
+        _sellLimit = _balanceLimit/10;     
+
     }
     
     function _setTaxes(uint burnTaxes, uint liquidityTaxes, uint marketingTaxes,bool setBuy,bool setSell, bool setTransfer) private{
@@ -1390,6 +1343,11 @@ contract Bu2 is IBEP20, Context, Ownable
     function getTransferTax() public view returns(uint,uint,uint){
         return (_transferTax.burn,_transferTax.liquidity,_transferTax.marketing);
     }
+    
+    function getBurnedTokens() public view returns(uint256)
+    {
+        return (_initialSupply-_totalSupply)/10**_decimals;
+    }
 
     function _calculateFee(uint256 amount, uint256 tax) private pure returns (uint256) {
         uint256 fee = (amount*tax) / 100;
@@ -1412,24 +1370,27 @@ contract Bu2 is IBEP20, Context, Ownable
         return _liquidityTokenAddress;
     }
 
-    //TODO change release to 1 day and unlock time to 7 days
+    //TODO change unlock time to 7 days
     function OwnerUnlockWhitelistTrading() public onlyOwner{
         require(_liquidityTokenAddress!=address(0),"LP Token not yet declared");
         require(!_tradingEnabled,"Trading already enabled");
+        
         TeamUpdateLimits();      
         _tradingEnabled=true;
         _whiteListTrading=true;
-        _nextBNBRelease=block.timestamp+10 minutes;
         _liquidityUnlockTime=block.timestamp+7 minutes;
     }
     function OwnerUnlockTrading() public onlyOwner{
         require(_tradingEnabled&&_whiteListTrading);
         _whiteListTrading=false;
+        //renounces Ownership Automatically at start doesnt actually do a thing, as Team still has access, 
+        //but people usually demand it, so they get it
+        renounceOwnership();
     }
 
     
     
-    //Functions to add To whitelist
+    //Functions for whitelist
     function OwnerAddToWhitelist(address addressToAdd) public onlyOwner{
         _whiteList.add(addressToAdd);
     }
@@ -1439,19 +1400,17 @@ contract Bu2 is IBEP20, Context, Ownable
             _whiteList.add(addressesToAdd[i]);
         }
     }
-    function isWhitelisted(address AddressToCheck) public view returns(bool)
-    {
-        return _whiteList.contains(AddressToCheck);
-    }
-    
     
     //Sets liquidityTokenAddress required for setup
     function OwnerSetupLiquidityTokenAddress(address liquidityTokenAddress) public onlyOwner{
         require(!_tradingEnabled,"This function is locked forever");
         _liquidityTokenAddress=liquidityTokenAddress;
     }
-    
 
+    function isWhitelisted(address AddressToCheck) public view returns(bool)
+    {
+        return _whiteList.contains(AddressToCheck);
+    }
     
 
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1466,24 +1425,26 @@ contract Bu2 is IBEP20, Context, Ownable
     function TeamlimitLiquidityReleaseTo20Percent() public onlyTeam{
         _liquidityRelease20Percent=true;
     }
+    
+    //Functions to prolong Liquidity Lock.
     //TestFunction
-    function unlockLiquidityIn10Minutes() public onlyTeam{
+    function TeamUnlockLiquidityIn10Minutes() public onlyTeam{
         uint256 newUnlockTime=block.timestamp+10 minutes; 
         require(newUnlockTime>_liquidityUnlockTime);
         _liquidityUnlockTime=newUnlockTime;
     }
     
-    function unlockLiquidityInWeek() public onlyTeam{
+    function TeamUnlockLiquidityInWeek() public onlyTeam{
         uint256 newUnlockTime=block.timestamp+7 days; 
         require(newUnlockTime>_liquidityUnlockTime);
         _liquidityUnlockTime=newUnlockTime;
     }
-    function unlockLiquidityIn6Months() public onlyTeam{
+    function TeamUnlockLiquidityIn6Months() public onlyTeam{
         uint256 newUnlockTime=block.timestamp+180 days; 
         require(newUnlockTime>_liquidityUnlockTime);
         _liquidityUnlockTime=newUnlockTime;
     }
-    function unlockLiquidityInAYear() public onlyTeam{
+    function TeamUnlockLiquidityInAYear() public onlyTeam{
         uint256 newUnlockTime=block.timestamp+365 days; 
         require(newUnlockTime>_liquidityUnlockTime);
         _liquidityUnlockTime=newUnlockTime;
@@ -1513,6 +1474,11 @@ contract Bu2 is IBEP20, Context, Ownable
             //_liquidityRelease20Percent should be called once everything is clear
             liquidityToken.transfer(_teamWallet, amount);
         }
+    }
+    
+    function GetLiquidityReleaseTimeInSeconds() public view returns (uint256)
+    {
+        return _liquidityUnlockTime;
     }
     
 
