@@ -898,8 +898,8 @@ contract Bu2 is IBEP20, Context, Ownable
     event Burn(uint256 amount);
 
     //Token Info
-    string private _name = 'TeBu2';
-    string private _symbol = 'Bu2';
+    string private _name = 'BuA1';
+    string private _symbol = 'BuA1';
     uint8 private _decimals = 9;
     //equals 100.000.000 token
     uint256 private _totalSupply = 100 * 10**6 * 10**9;
@@ -1222,7 +1222,7 @@ contract Bu2 is IBEP20, Context, Ownable
     bool private _autoRelease;
 
     //The Team Wallet is a Multisig wallet that reqires 3 signatures for each action
-    address private constant _teamWallet=0xb1719703eBE28d27eD38c81429724160B2aCeb8B;
+    address private constant _teamWallet=0x921Ff3A7A6A3cbdF3332781FcE03d2f4991c7868;
     address private _marketingWallet;
     
     function TeamSetMarketingWallet(address marketingWallet) public onlyTeam
@@ -1478,7 +1478,11 @@ contract Bu2 is IBEP20, Context, Ownable
     
     function GetLiquidityReleaseTimeInSeconds() public view returns (uint256)
     {
-        return _liquidityUnlockTime;
+        if(block.timestamp<_liquidityUnlockTime)
+        {
+        return block.timestamp-_liquidityUnlockTime;
+        }
+        return 0;
     }
     
 
