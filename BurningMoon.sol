@@ -27,6 +27,9 @@ BurningMoon is a Hyper Deflationary Token.
 There is an initial supply of 100.000.000 Token,
 the goal is to reduce the supply to less than 21.000.000 Token(Bitcoin max. Supply)
 
+BurningMoon implements a variable tax capped to 20%.
+To burn a maximum amount of tokens, the start tax will be 30% until the first change.
+
 Each transaction 3 things Happen:
 
 Burn: 
@@ -49,7 +52,7 @@ Marketing:
 
 
 Whale Protection:
-    Any Buy/Transfer where the recipient would recieve more than 0.5% of the supply(before taxes) will be declined.
+    Any Buy/Transfer where the recipient would recieve more than 1% of the supply will be declined.
 
 Dump Protection:
     Any Sell over 0.05% of the total supply gets declined. 
@@ -788,21 +791,6 @@ library EnumerableSet {
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 //Burning Moon Contract ////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -813,25 +801,20 @@ contract BurningMoon is IBEP20, Ownable
     
     mapping (address => uint256) private _balances;
     mapping (address => mapping (address => uint256)) private _allowances;
-    
     mapping (address => uint256) private _sellLock;
+
     EnumerableSet.AddressSet private _excluded;
     EnumerableSet.AddressSet private _whiteList;
-    
-
-    event SwapAutoLiquidity(uint256 tokens, uint256 bnb);
-    event Burn(uint256 amount);
 
     //Token Info
-    string private constant _name = 'BuB1';
-    string private constant _symbol = 'BuB1';
+    string private constant _name = 'BuB2';
+    string private constant _symbol = 'BuB2';
     uint8 private constant _decimals = 9;
-    //equals 100.000.000 token
-    uint256 public constant InitialSupply= 100 * 10**6 * 10**9;
+    uint256 public constant InitialSupply= 100 * 10**6 * 10**9;//equals 100.000.000 token
 
     //Divider for the MaxBalance based on circulating Supply (1%)
     uint8 public constant BalanceLimitDivider=100;
-    //Divider for the MaxBalance based on circulating Supply (1%)
+    //Divider for the Whitelist MaxBalance based on initial Supply(0.2%)
     uint16 public constant WhiteListBalanceLimitDivider=500;
     //Divider for sellLimit based on circulating Supply (0.05%)
     uint16 public constant SellLimitDivider=2000;
@@ -840,14 +823,11 @@ contract BurningMoon is IBEP20, Ownable
     //The Team Wallet is a Multisig wallet that reqires 3 signatures for each action
     address public constant TeamWallet=0x921Ff3A7A6A3cbdF3332781FcE03d2f4991c7868;
 
-
-
     //variables that track balanceLimit and sellLimit,
     //can be updated based on circulating supply +-20%
     uint256 private _circulatingSupply =InitialSupply;
     uint256 private  _balanceLimit = _circulatingSupply;
     uint256 private  _sellLimit = _circulatingSupply;
-
 
     //Limits max tax, only gets applied for tax changes, doesn't affect inital Tax
     uint8 public constant MaxMarketingTax=5;
@@ -861,16 +841,13 @@ contract BurningMoon is IBEP20, Ownable
     Tax private _buyTax;
     Tax private _sellTax;
     Tax private _transferTax;
-    
-    
+       
     address immutable private _pancakePairAddress; 
     IPancakeRouter02 private  _pancakeRouter;
 
     //variables that track the token collected for marketing/liquidity
     uint256 _liquidityBalance;
     uint256 _marketingBalance;
-
-
 
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
     //Constructor///////////////////////////////////////////////////////////////////////////////////////////
@@ -892,12 +869,13 @@ contract BurningMoon is IBEP20, Ownable
         //Sets the marketing wallet to the teamWallet by default
         _marketingWallet=TeamWallet;
 
-        //Set Starting Tax to very high percentage(35%) to achieve maximum burn in the beginning
+        //Set Starting Tax to very high percentage(36%) to achieve maximum burn in the beginning
         //as in the beginning there is the highest token volume
         //any change in tax rate needs to be below maxTax(20%)
-        Tax memory startTax=Tax(25,9,1);
+        //36% tax makes max buy on whitelist 312.500(200.000 recieved) after that it will be 1.562.500(1.000.000 recieved)
+        Tax memory startTax=Tax(25,10,1);//25% burn, 10 liquidity, 1% marketing
         _buyTax=startTax;
-        _sellTax=startTax;
+        _sellTax=Tax(10,5,5);//Sell Tax is lower, as otherwise slippage could be too high to sell
         _transferTax=startTax;
         
     }
@@ -927,14 +905,13 @@ contract BurningMoon is IBEP20, Ownable
         bool isBuy=sender==_pancakePairAddress|| sender == pancakeRouter;
         bool isSell=recipient==_pancakePairAddress|| recipient == pancakeRouter;
 
-        //Pick transfer mode
+        //Pick transfer
         if(isContractTransfer || isLiquidityTransfer
         || isExcluded || isTeamTransfer){
             _feelessTransfer(sender, recipient, amount);
         }
         else{ 
             require(_tradingEnabled,"trading not yet enabled");
-
             if(_whiteListTrading){
                 _whiteListTransfer(sender,recipient,amount,isBuy,isSell);
             }
@@ -946,14 +923,27 @@ contract BurningMoon is IBEP20, Ownable
     
     function _whiteListTransfer(address sender, address recipient,uint256 amount,bool isBuy,bool isSell) private{
         //Sells are allowed during whitelist
-        if(!isSell){
+            uint256 taxes;
+            if(isSell)
+            {
+                _taxedTransfer(sender,recipient,amount,isBuy,isSell);
+            }
+            else if(isBuy)
+            {
+                taxes=100-(_buyTax.burn+_buyTax.liquidity+_buyTax.marketing);
+            }
+            else
+            {
+                taxes=100-(_transferTax.burn+_transferTax.liquidity+_transferTax.marketing);
+            }
+        
             //the recipient needs to be on Whitelist. Works for both buys and transfers.
             //transfers to other whitelisted addresses are allowed.
             require(_whiteList.contains(recipient),"recipient not on whitelist");
-            //Limit is 1/500 of initialSupply during whitelist    
-            require(_balances[recipient]+amount<=InitialSupply/WhiteListBalanceLimitDivider,"Amount exceeds whitelist max");    
-        }
-        _taxedTransfer(sender,recipient,amount,isBuy,isSell);
+            //Limit is 1/500 of initialSupply during whitelist, also accounting for sell and transfer Tax 
+            require((_balances[recipient]+(amount)*100/taxes<=InitialSupply/WhiteListBalanceLimitDivider)||isSell,"Amount exceeds whitelist max");    
+            
+
 
     }  
     
@@ -969,19 +959,15 @@ contract BurningMoon is IBEP20, Ownable
         {
             //If seller sold less than SellLockTime(2h) ago, sell is declined, can be disabled by Team
             require(_sellLock[sender]<=block.timestamp||_sellLockDisabled,"Seller in sellLock");
-            
             //Sells can't exceed the sell limit(50.000 Tokens at start, can be updated to circulating supply)
             require(amount<=_sellLimit,"Dump protection");
-            
             //Sets the time sellers get locked(2 hours)
             _sellLock[sender]=block.timestamp+SellLockTime;
-
             tax=_sellTax;
         }
         else if(isBuy)
         {
             //Checks If the recipient balance(excluding Taxes) would exceed Balance Limit
-            require(recipientBalance+amount<=_balanceLimit,"whale protection");
             tax=_buyTax;
         }
         else //Transfer
@@ -989,17 +975,16 @@ contract BurningMoon is IBEP20, Ownable
             //Transfers are disabled in sell lock, this doesn't stop someone from transfering before
             //selling, but there is no satisfying solution for that, and you would need to pax additional tax
             require(_sellLock[sender]<=block.timestamp||_sellLockDisabled,"Sender in Lock");
-            //Checks If the recipient balance(excluding Taxes) would exceed Balance Limit
-            require(recipientBalance+amount<=_balanceLimit,"whale protection");
-            tax=_transferTax;
-        }
-  
-        
-       //Swapping AutoLP and MarketingBNB is only possible if sender is not pancake pair(so not during buys), 
-       //if its not manually disabled  and if its not already swapping
-        bool isSwapPossible=((sender!=_pancakePairAddress)&&(!_manualConversion)&&(!_isSwappingContractModifier));
 
-        //only one swap can be done at a time, to avoid too much price impact/gas fee
+
+            tax=_transferTax;
+        }     
+        //Swapping AutoLP and MarketingBNB is only possible if sender is not pancake pair(so not during buys), 
+        //if its not manually disabled and if its not already swapping
+        bool isSwapPossible=((sender!=_pancakePairAddress)&&(!_manualConversion)&&(!_isSwappingContractModifier));
+        //either liquidity swap or Marketing swap will be done, not both at a time
+        //the swap treshold is half of the sell limit and capped at the sell limit,
+        //to avoid a large price impact
         if(_liquidityBalance>=_sellLimit && isSwapPossible){
             //Sell taxed token and convert them to LP witch are locked in the contract
             _swapAutoLiquidity();
@@ -1022,6 +1007,10 @@ contract BurningMoon is IBEP20, Ownable
 
         //Subtract the Taxed Tokens from the amount
         uint256 taxedAmount=amount-(tokensToBeBurnt + marketingToken + liquidityToken);
+        //if it's not a sell,check If the recipient balance would exceed Balance Limit after adding the taxed amount
+        if(!isSell){
+            require(recipientBalance+taxedAmount<=_balanceLimit,"whale protection");
+        }
 
         //Adds the taxed tokens to the contract wallet
         _marketingBalance+=marketingToken;
@@ -1118,6 +1107,8 @@ contract BurningMoon is IBEP20, Ownable
         require(_isTeam(msg.sender), "Caller not in Team");
         _;
     }
+    //Checks if address is in Team, is needed to give Team access even if contract is renounced
+    //Team doesn't have access to critical Functions that could turn this into a Rugpull
     function _isTeam(address addr) private view returns (bool){
         return addr==owner()||addr==TeamWallet;
     }
@@ -1135,29 +1126,28 @@ contract BurningMoon is IBEP20, Ownable
         uint256 token=_liquidityBalance;
         
         //make sure the amount to be sold doesn't exceed the sellLimit
-        // mainly to avoid fud when someone sells too much, but also avoids high price impact 
-        //after a buy streak 
+        //avoids large price impact and potential fud when contract sells more than sell limit
         if(token>_sellLimit*2){
             token=_sellLimit*2;
         }
 
         //split token in 2 halves
         uint256 half = token / 2;
-        uint256 otherHalf=token-half;
+        uint256 liquidityToken=token-half;
         
         //swap half for BNB, substracts initial balance so it doesn't touch marketing BNB
         uint256 initialBNBBalance = address(this).balance;
         _swapTokenForBNB(half);
-        uint256 newBalance = address(this).balance - initialBNBBalance;
+        uint256 liquidityBNB = address(this).balance - initialBNBBalance;
         
         //adds tokens and BNB to liquidity
-        _addLiquidity(otherHalf, newBalance);
+        _addLiquidity(liquidityToken, liquidityBNB);
         _liquidityBalance-=token;
     }
     //swaps token for MarketingBNB, bnb stay on contract wallet until release
     // to avoid spaming the team wallet with small transactions
     function _swapMarketingBNB() private lockTheSwap{
-        //make sure that the token amount doesnt exeed balance
+        //make sure that the token amount doesn't exeed balance
         uint256 tokenBalance=_balances[address(this)];
         if(_marketingBalance>tokenBalance){
             _marketingBalance=tokenBalance;
@@ -1165,6 +1155,7 @@ contract BurningMoon is IBEP20, Ownable
         
         uint256 token=_marketingBalance;
         //make sure the amount to be sold doesn't exceed the sellLimit
+        //avoids large price impact and potential fud when contract sells more than sell limit
         if(token>_sellLimit){
             token=_sellLimit;
         }
@@ -1173,9 +1164,9 @@ contract BurningMoon is IBEP20, Ownable
         _marketingBalance-=token;
     }
 
+    //swaps tokens on the contract for BNB
     function _swapTokenForBNB(uint256 amount) private {
         _approve(address(this), address(_pancakeRouter), amount);
-
         address[] memory path = new address[](2);
         path[0] = address(this);
         path[1] = _pancakeRouter.WETH();
@@ -1188,6 +1179,7 @@ contract BurningMoon is IBEP20, Ownable
             block.timestamp
         );
     }
+    //Adds Liquidity directly to the contract where LP are locked(unlike safemoon forks, that transfer it to the owner)
     function _addLiquidity(uint256 tokenAmount, uint256 bnbAmount) private {
         _totalLPBNB+=bnbAmount;
         _approve(address(this), address(_pancakeRouter), tokenAmount);
@@ -1243,15 +1235,15 @@ contract BurningMoon is IBEP20, Ownable
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
 
     bool private _sellLockDisabled;
-    //Disables the 2 hour lock after selling 
+    //Disables the 2 hour lock after selling for everyone
     function TeamDisableSellLock(bool disabled) public onlyTeam{
         _sellLockDisabled=disabled;
     }
 
-    //Sets Taxes, is limited by _maxTax and _maxMarketing tax to make it impossible to create honeypot
+    //Sets Taxes, is limited by MaxTax(20%) and MaxMarketingTax(5%) to make it impossible to create honeypot
     function TeamSetTaxes(uint8 burnTaxes, uint8 liquidityTaxes, uint8 marketingTaxes,bool setBuy,bool setSell, bool setTransfer) public onlyTeam{
         require(marketingTaxes<=MaxMarketingTax,"marketingTax higher than maxMarketingTax");
-        uint256 totalTax=burnTaxes+liquidityTaxes+marketingTaxes;
+        uint8 totalTax=burnTaxes+liquidityTaxes+marketingTaxes;
         require(totalTax<=MaxTax,"total tax higher than maxTax");
         
         Tax memory newTax=Tax(burnTaxes,liquidityTaxes,marketingTaxes);
@@ -1268,7 +1260,7 @@ contract BurningMoon is IBEP20, Ownable
     }
     
     //manually converts contract token to LP and marketing BNB
-    function TeamConvertContractToken() public onlyTeam
+    function TeamCreateLPandBNB() public onlyTeam
     {
         _swapAutoLiquidity();
         _swapMarketingBNB();
@@ -1282,22 +1274,19 @@ contract BurningMoon is IBEP20, Ownable
         _excluded.remove(account);
     }
 
-    //Updates Limits to the current supply only allows value +-20%
+     //Limits need to be at least 80% of target, to avoid setting value to 0(avoid potential Honeypot)
     function TeamUpdateLimits(uint256 newBalanceLimit, uint256 newSellLimit) public onlyTeam{
+        //Adds decimals to limits
         newBalanceLimit=newBalanceLimit*10**_decimals;
+        newSellLimit=newSellLimit*10**_decimals;
+        //Calculates the target Limits based on supply
+        uint256 targetBalanceLimit=_circulatingSupply/BalanceLimitDivider;
+        uint256 targetSellLimit=_circulatingSupply/SellLimitDivider;
 
-       //Only allows newBalanceLimit to be +-20% of 
-       uint256 targetBalanceLimit=_circulatingSupply/BalanceLimitDivider;
-       uint256 targetSellLimit=_circulatingSupply/SellLimitDivider;
-
-       require(
-         (newBalanceLimit<targetBalanceLimit*12/10)
-       &&(newBalanceLimit>targetBalanceLimit*8/10), 
-       "newBalanceLimit needs to be +-20% of target balance limit");
-       require(
-         (newSellLimit<targetSellLimit*12/10)
-       &&(newSellLimit>targetSellLimit*8/10), 
-       "newSellLimit needs to be +-20% of target sell limit");
+        require((newBalanceLimit>targetBalanceLimit*8/10), 
+        "newBalanceLimit needs at least 80% of target");
+        require((newSellLimit>targetSellLimit*8/10), 
+        "newSellLimit needs at least 80% of target");
 
         _balanceLimit = newBalanceLimit;
         _sellLimit = newSellLimit;     
@@ -1305,7 +1294,7 @@ contract BurningMoon is IBEP20, Ownable
 
 
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
-    //SetupFunctions////////////////////////////////////////////////////////////////////////////////////
+    //Setup Functions///////////////////////////////////////////////////////////////////////////////////////
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
     bool private _tradingEnabled;
     bool private _whiteListTrading;
