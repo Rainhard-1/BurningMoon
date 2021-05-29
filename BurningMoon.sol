@@ -28,7 +28,7 @@ There is an initial supply of 100.000.000 Token,
 the goal is to reduce the supply to less than 21.000.000 Token(Bitcoin max. Supply)
 
 BurningMoon implements a variable tax capped to 20%.
-To burn a maximum amount of tokens, the start tax will be 30% until the first change.
+To burn a maximum amount of tokens, the start tax will be 36% for buys/transfers until the first change.
 
 Each transaction 3 things Happen:
 
@@ -807,10 +807,10 @@ contract BurningMoon is IBEP20, Ownable
     EnumerableSet.AddressSet private _whiteList;
 
     //Token Info
-    string private constant _name = 'BuB2';
-    string private constant _symbol = 'BuB2';
+    string private constant _name = 'BuB3';
+    string private constant _symbol = 'BuB3';
     uint8 private constant _decimals = 9;
-    uint256 public constant InitialSupply= 100 * 10**6 * 10**9;//equals 100.000.000 token
+    uint256 public constant InitialSupply= 100 * 10**6 * 10**_decimals;//equals 100.000.000 token
 
     //Divider for the MaxBalance based on circulating Supply (1%)
     uint8 public constant BalanceLimitDivider=100;
@@ -818,10 +818,15 @@ contract BurningMoon is IBEP20, Ownable
     uint16 public constant WhiteListBalanceLimitDivider=500;
     //Divider for sellLimit based on circulating Supply (0.05%)
     uint16 public constant SellLimitDivider=2000;
-    //Sellers get locked for SellLockTime so they can't dump repeatedly
-    uint16 public constant SellLockTime= 2 hours;
+    //Sellers get locked for MaxSellLockTime so they can't dump repeatedly
+    uint16 public constant MaxSellLockTime= 2 hours;
+    //TODO: Change to 7 days
+    //The time Liquidity gets locked at start and prolonged once it gets released
+    uint256 private constant DefaultLiquidityLockTime=1 hours;
     //The Team Wallet is a Multisig wallet that reqires 3 signatures for each action
     address public constant TeamWallet=0x921Ff3A7A6A3cbdF3332781FcE03d2f4991c7868;
+
+    address private constant PancakeRouter=0x10ED43C718714eb63d5aA57B78B54704E256024E;
 
     //variables that track balanceLimit and sellLimit,
     //can be updated based on circulating supply +-20%
@@ -830,35 +835,36 @@ contract BurningMoon is IBEP20, Ownable
     uint256 private  _sellLimit = _circulatingSupply;
 
     //Limits max tax, only gets applied for tax changes, doesn't affect inital Tax
-    uint8 public constant MaxMarketingTax=5;
     uint8 public constant MaxTax=20;
     //Tracks the current Taxes, different Taxes can be applied for buy/sell/transfer
-    struct Tax {
-        uint8 burn;
-        uint8 liquidity;
-        uint8 marketing;
-    }
-    Tax private _buyTax;
-    Tax private _sellTax;
-    Tax private _transferTax;
+
+    uint8 private _buyTax;
+    uint8 private _sellTax;
+    uint8 private _transferTax;
+
+    uint8 private _burnTax;
+    uint8 private _liquidityTax;
+    uint8 private _marketingTax;
+
        
     address immutable private _pancakePairAddress; 
     IPancakeRouter02 private  _pancakeRouter;
-
-    //variables that track the token collected for marketing/liquidity
-    uint256 _liquidityBalance;
-    uint256 _marketingBalance;
 
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
     //Constructor///////////////////////////////////////////////////////////////////////////////////////////
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
     constructor () {
-        //contract creator gets all token at start to make a Liquidity Pair
-        _balances[msg.sender] = _circulatingSupply;
-        emit Transfer(address(0), msg.sender, _circulatingSupply);
+        //contract creator 90% of the token to create LP-Pair
+        uint256 deployerBalance=_circulatingSupply*9/10;
+        _balances[msg.sender] = deployerBalance;
+        emit Transfer(address(0), msg.sender, deployerBalance);
+        //contract gets 10% of the token to generate LP token fast
+        uint256 injectBalance=_circulatingSupply-deployerBalance;
+        _balances[address(this)]=injectBalance;
+       emit Transfer(address(0), address(this),injectBalance);
 
-        // Pancake Router Address
-        _pancakeRouter = IPancakeRouter02(0x10ED43C718714eb63d5aA57B78B54704E256024E);
+        // Pancake Router
+        _pancakeRouter = IPancakeRouter02(PancakeRouter);
         //Creates a Pancake Pair
         _pancakePairAddress = IPancakeFactory(_pancakeRouter.factory()).createPair(address(this), _pancakeRouter.WETH());
 
@@ -868,16 +874,20 @@ contract BurningMoon is IBEP20, Ownable
 
         //Sets the marketing wallet to the teamWallet by default
         _marketingWallet=TeamWallet;
+       //Sets sellLockTime to be max by default
+        _sellLockTime=MaxSellLockTime;
 
         //Set Starting Tax to very high percentage(36%) to achieve maximum burn in the beginning
         //as in the beginning there is the highest token volume
         //any change in tax rate needs to be below maxTax(20%)
-        //36% tax makes max buy on whitelist 312.500(200.000 recieved) after that it will be 1.562.500(1.000.000 recieved)
-        Tax memory startTax=Tax(25,10,1);//25% burn, 10 liquidity, 1% marketing
-        _buyTax=startTax;
-        _sellTax=Tax(10,5,5);//Sell Tax is lower, as otherwise slippage could be too high to sell
-        _transferTax=startTax;
-        
+        _buyTax=36;
+        _sellTax=20;//Sell Tax is lower, as otherwise slippage could be too high to sell
+        _transferTax=36;
+        //97% gets burned
+        _burnTax=97;
+        //a small percentage gets added to the Contract token as 10% of token are already injected.
+        _liquidityTax=2;
+        _marketingTax=1;
     }
 
 
@@ -889,15 +899,12 @@ contract BurningMoon is IBEP20, Ownable
         require(recipient != address(0), "Transfer to zero");
         //Manually Excluded adresses are transfering tax and lock free
         bool isExcluded = (_excluded.contains(sender) || _excluded.contains(recipient));
-        
         //Transactions from and to the contract are always tax and lock free
         bool isContractTransfer=(sender==address(this) || recipient==address(this));
-
         //transfers between PancakeRouter and PancakePair are tax and lock free
         address pancakeRouter=address(_pancakeRouter);
         bool isLiquidityTransfer = ((sender == _pancakePairAddress && recipient == pancakeRouter) 
         || (recipient == _pancakePairAddress && sender == pancakeRouter));
-
         //Team transfers tax and lock free
         bool isTeamTransfer=(_isTeam(sender) || _isTeam(recipient));
 
@@ -911,6 +918,7 @@ contract BurningMoon is IBEP20, Ownable
             _feelessTransfer(sender, recipient, amount);
         }
         else{ 
+            //once trading is enabled, it can't be turned off again
             require(_tradingEnabled,"trading not yet enabled");
             if(_whiteListTrading){
                 _whiteListTransfer(sender,recipient,amount,isBuy,isSell);
@@ -922,100 +930,68 @@ contract BurningMoon is IBEP20, Ownable
     }
     
     function _whiteListTransfer(address sender, address recipient,uint256 amount,bool isBuy,bool isSell) private{
-        //Sells are allowed during whitelist
-            uint256 taxes;
-            if(isSell)
+        //only apply whitelist restrictions during buys and transfers
+            if(!isSell)
             {
-                _taxedTransfer(sender,recipient,amount,isBuy,isSell);
-            }
-            else if(isBuy)
-            {
-                taxes=100-(_buyTax.burn+_buyTax.liquidity+_buyTax.marketing);
-            }
-            else
-            {
-                taxes=100-(_transferTax.burn+_transferTax.liquidity+_transferTax.marketing);
-            }
-        
             //the recipient needs to be on Whitelist. Works for both buys and transfers.
             //transfers to other whitelisted addresses are allowed.
             require(_whiteList.contains(recipient),"recipient not on whitelist");
-            //Limit is 1/500 of initialSupply during whitelist, also accounting for sell and transfer Tax 
-            require((_balances[recipient]+(amount)*100/taxes<=InitialSupply/WhiteListBalanceLimitDivider)||isSell,"Amount exceeds whitelist max");    
-            
-
+            //Limit is 1/500 of initialSupply during whitelist
+            require((_balances[recipient]+amount<=InitialSupply/WhiteListBalanceLimitDivider),"Amount exceeds whitelist max");    
+            }
+            _taxedTransfer(sender,recipient,amount,isBuy,isSell);
 
     }  
-    
     function _taxedTransfer(address sender, address recipient, uint256 amount,bool isBuy,bool isSell) private{
         uint256 recipientBalance = _balances[recipient];
         uint256 senderBalance = _balances[sender];
         require(senderBalance >= amount, "Transfer exceeds balance");
 
-
-
-        Tax memory tax;
-        if(isSell)
-        {
-            //If seller sold less than SellLockTime(2h) ago, sell is declined, can be disabled by Team
+        uint8 tax;
+        if(isSell){
+            //If seller sold less than _sellLockTime(2h) ago, sell is declined, can be disabled by Team
             require(_sellLock[sender]<=block.timestamp||_sellLockDisabled,"Seller in sellLock");
             //Sells can't exceed the sell limit(50.000 Tokens at start, can be updated to circulating supply)
             require(amount<=_sellLimit,"Dump protection");
-            //Sets the time sellers get locked(2 hours)
-            _sellLock[sender]=block.timestamp+SellLockTime;
+            //Sets the time sellers get locked(2 hours by default)
+            _sellLock[sender]=block.timestamp+_sellLockTime;
             tax=_sellTax;
         }
-        else if(isBuy)
-        {
+        else if(isBuy){
             //Checks If the recipient balance(excluding Taxes) would exceed Balance Limit
+            require(recipientBalance+amount<=_balanceLimit,"whale protection");
             tax=_buyTax;
         }
-        else //Transfer
-        {
+        else {//Transfer
+            //Checks If the recipient balance(excluding Taxes) would exceed Balance Limit
+            require(recipientBalance+amount<=_balanceLimit,"whale protection");
             //Transfers are disabled in sell lock, this doesn't stop someone from transfering before
             //selling, but there is no satisfying solution for that, and you would need to pax additional tax
             require(_sellLock[sender]<=block.timestamp||_sellLockDisabled,"Sender in Lock");
-
-
             tax=_transferTax;
         }     
         //Swapping AutoLP and MarketingBNB is only possible if sender is not pancake pair(so not during buys), 
         //if its not manually disabled and if its not already swapping
-        bool isSwapPossible=((sender!=_pancakePairAddress)&&(!_manualConversion)&&(!_isSwappingContractModifier));
-        //either liquidity swap or Marketing swap will be done, not both at a time
-        //the swap treshold is half of the sell limit and capped at the sell limit,
-        //to avoid a large price impact
-        if(_liquidityBalance>=_sellLimit && isSwapPossible){
-            //Sell taxed token and convert them to LP witch are locked in the contract
-            _swapAutoLiquidity();
-        } 
-        else if((_marketingBalance>=_sellLimit/2) && isSwapPossible){
-            //sell taxed token for BNB and leave them in the Contract Wallet to be distributed later
-            _swapMarketingBNB();
+        if((sender!=_pancakePairAddress)&&(!_manualConversion)&&(!_isSwappingContractModifier)){
+            _swapContractToken();
         }
-        else if(_autoRelease && isBuy){
-            //only auto release Marketing bnb during buys, so release can't be abused to create Honeypot.
-            //only releases if auto release is on, and contract hold exceeds treshold.
+        //autoReleases Marketing bnb, once hold exceeds treshold, if autoRelease is enabled and if it's a buy
+        //to avoid creating a honeypot if marketing wallet is faulty
+        if(_autoRelease && isBuy){
+
             _autoReleaseMarketingBNB();
         }
 
-        
         //Calculates the exact token amount for each tax
-        uint256 tokensToBeBurnt=_calculateFee(amount, tax.burn);
-        uint256 marketingToken=_calculateFee(amount,tax.marketing);
-        uint256 liquidityToken=_calculateFee(amount,tax.liquidity);
+        uint256 tokensToBeBurnt=_calculateFee(amount, tax, _burnTax);
+        uint256 contractToken=_calculateFee(amount, tax, _marketingTax+_liquidityTax);
+        
 
         //Subtract the Taxed Tokens from the amount
-        uint256 taxedAmount=amount-(tokensToBeBurnt + marketingToken + liquidityToken);
-        //if it's not a sell,check If the recipient balance would exceed Balance Limit after adding the taxed amount
-        if(!isSell){
-            require(recipientBalance+taxedAmount<=_balanceLimit,"whale protection");
-        }
+        uint256 taxedAmount=amount-(tokensToBeBurnt + contractToken);
 
         //Adds the taxed tokens to the contract wallet
-        _marketingBalance+=marketingToken;
-        _liquidityBalance+=liquidityToken;
-        _balances[address(this)] += marketingToken+liquidityToken;
+        _balances[address(this)] += contractToken;
         
         //Transfers the tokens
         _balances[sender]-=amount;
@@ -1062,6 +1038,7 @@ contract BurningMoon is IBEP20, Ownable
     function TeamSwitchAutoBNBRelease(bool autoRelease) public onlyTeam{
         _autoRelease=autoRelease;
     }
+    //Changes the treshold when Merketing BNB should be auto-released
     function TeamChangeReleaseTreshold(uint256 releaseTreshold) public onlyTeam{
         _releaseTreshold=releaseTreshold;
     }
@@ -1113,56 +1090,36 @@ contract BurningMoon is IBEP20, Ownable
         return addr==owner()||addr==TeamWallet;
     }
 
-
-    //adds Liquidity. other than Safemoon forks, LP-Token stay on contract, from witch they can only be released 
-    //after Unlock time is over, this makes a rugpull and draining volume impossible(as long it's locked)
-    function _swapAutoLiquidity() private lockTheSwap{
-        
-        //make sure to swap less tokens than balance
-        uint256 tokenBalance=_balances[address(this)];
-        if(_liquidityBalance>tokenBalance){
-            _liquidityBalance=tokenBalance;
+    //swaps the token on the contract for Marketing BNB and LP Token.
+    //always swaps the _sellLimit of token to avoid a large price impact
+    function _swapContractToken() private lockTheSwap{
+        uint256 contractBalance=_balances[address(this)];
+        uint16 totalTax=_liquidityTax+_marketingTax;
+        uint256 tokenToSwap=_sellLimit;
+        //only swap if contractBalance is larger than tokenToSwap, and totalTax is unequal to 0
+        if(contractBalance<tokenToSwap||totalTax==0){
+            return;
         }
-        uint256 token=_liquidityBalance;
-        
-        //make sure the amount to be sold doesn't exceed the sellLimit
-        //avoids large price impact and potential fud when contract sells more than sell limit
-        if(token>_sellLimit*2){
-            token=_sellLimit*2;
-        }
+        //splits the token in TokenForLiquidity and token for Marketing
+        uint256 tokenForLiquidity=(tokenToSwap*_liquidityTax)/totalTax;
+        uint256 tokenForMarketing= tokenToSwap-tokenForLiquidity;
 
-        //split token in 2 halves
-        uint256 half = token / 2;
-        uint256 liquidityToken=token-half;
-        
-        //swap half for BNB, substracts initial balance so it doesn't touch marketing BNB
+        //splits tokenForLiquidity in 2 halves
+        uint256 liqToken=tokenForLiquidity/2;
+        uint256 liqBNBToken=tokenForLiquidity-liqToken;
+
+        //swaps marktetingToken and the liquidity token half for BNB
+        uint256 swapToken=liqBNBToken+tokenForMarketing;
         uint256 initialBNBBalance = address(this).balance;
-        _swapTokenForBNB(half);
-        uint256 liquidityBNB = address(this).balance - initialBNBBalance;
-        
-        //adds tokens and BNB to liquidity
-        _addLiquidity(liquidityToken, liquidityBNB);
-        _liquidityBalance-=token;
+        _swapTokenForBNB(swapToken);
+
+        //calculates the amount of BNB belonging to the LP-Pair and converts them to LP
+        uint256 liqBNB = ((address(this).balance - initialBNBBalance)*liqBNBToken)/swapToken;
+        _addLiquidity(liqToken, liqBNB);
     }
-    //swaps token for MarketingBNB, bnb stay on contract wallet until release
-    // to avoid spaming the team wallet with small transactions
-    function _swapMarketingBNB() private lockTheSwap{
-        //make sure that the token amount doesn't exeed balance
-        uint256 tokenBalance=_balances[address(this)];
-        if(_marketingBalance>tokenBalance){
-            _marketingBalance=tokenBalance;
-        }
-        
-        uint256 token=_marketingBalance;
-        //make sure the amount to be sold doesn't exceed the sellLimit
-        //avoids large price impact and potential fud when contract sells more than sell limit
-        if(token>_sellLimit){
-            token=_sellLimit;
-        }
-        //Do The Swap
-        _swapTokenForBNB(token);
-        _marketingBalance-=token;
-    }
+
+
+
 
     //swaps tokens on the contract for BNB
     function _swapTokenForBNB(uint256 amount) private {
@@ -1194,8 +1151,8 @@ contract BurningMoon is IBEP20, Ownable
     }
 
     //Calculates the tokens that should be taxed
-    function _calculateFee(uint256 amount, uint256 tax) private pure returns (uint256) {
-        return (amount*tax) / 100;
+    function _calculateFee(uint256 amount, uint8 tax, uint8 taxPercent) private pure returns (uint256) {
+        return (amount*tax*taxPercent) / 10000;
     }
 
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1207,65 +1164,85 @@ contract BurningMoon is IBEP20, Ownable
         }
         return 0;
     }
-    function isLiquidityReleaseLimitedTo20Percent() public view returns(bool){
+    function getLiquidityReleaseLimitedTo20Percent() public view returns(bool){
         return _liquidityRelease20Percent;
     }
     function getBurnedTokens() public view returns(uint256){
         return (InitialSupply-_circulatingSupply)/10**_decimals;
     }
+
     function getLimits() public view returns(uint256 balanceLimit, uint256 sellLimit){
         return(_balanceLimit/10**_decimals, _sellLimit/10**_decimals);
     }
-    function getBuyTax() public view returns(uint burn,uint liquidity,uint marketing){
-        return (_buyTax.burn,_buyTax.liquidity,_buyTax.marketing);
-    }
-    function getSellTax() public view returns(uint burn,uint liquidity,uint marketing){
-        return (_sellTax.burn,_sellTax.liquidity,_sellTax.marketing);
-    }
-    function getTransferTax() public view returns(uint burn,uint liquidity,uint marketing){
-        return (_transferTax.burn,_transferTax.liquidity,_transferTax.marketing);
+
+    function getTaxes() public view returns(uint256 burnTax,uint256 liquidityTax,uint256 marketingTax, uint256 buyTax, uint256 sellTax, uint256 transferTax){
+        return (_burnTax,_liquidityTax,_marketingTax,_buyTax,_sellTax,_transferTax);
     }
 
     function getAutoLPBNBGenerated() public view returns (uint256){
         return _totalLPBNB;
     }  
 
+    function getWhitelistedStatus(address AddressToCheck) public view returns(bool){
+        return _whiteList.contains(AddressToCheck);
+    }
+
+    function getAddressSellLockTimeInSeconds(address AddressToCheck) public view returns (uint256){
+       uint256 lockTime=_sellLock[AddressToCheck];
+       if(lockTime<=block.timestamp)
+       {
+           return 0;
+       }
+       return lockTime-block.timestamp;
+    }
+    function getSellLockTimeInSeconds() public view returns(uint256){
+        return _sellLockTime;
+    }
+    function getSellLockEnabledStatus() public view returns(bool){
+        return !_sellLockDisabled;
+    }
+
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
     //Settings//////////////////////////////////////////////////////////////////////////////////////////////
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
 
     bool private _sellLockDisabled;
+    uint256 _sellLockTime;
     //Disables the 2 hour lock after selling for everyone
     function TeamDisableSellLock(bool disabled) public onlyTeam{
         _sellLockDisabled=disabled;
     }
+    //Sets SellLockTime, needs to be lower than MaxSellLockTime
+    function TeamSetSellLockTime(uint8 sellLockMinutes)public onlyTeam{
+            uint256 newSellLockTime= sellLockMinutes*60;
+            require(newSellLockTime<=MaxSellLockTime,"Sell Lock time too high");
+            _sellLockTime=newSellLockTime;
+    } 
+    function TeamResetSellLockTimeFor(address addressToReset) public onlyTeam{
+        _sellLock[addressToReset]=0;
+    }
 
-    //Sets Taxes, is limited by MaxTax(20%) and MaxMarketingTax(5%) to make it impossible to create honeypot
-    function TeamSetTaxes(uint8 burnTaxes, uint8 liquidityTaxes, uint8 marketingTaxes,bool setBuy,bool setSell, bool setTransfer) public onlyTeam{
-        require(marketingTaxes<=MaxMarketingTax,"marketingTax higher than maxMarketingTax");
+    //Sets Taxes, is limited by MaxTax(20%) to make it impossible to create honeypot
+    function TeamSetTaxes(uint8 burnTaxes, uint8 liquidityTaxes, uint8 marketingTaxes,uint8 buyTax, uint8 sellTax, uint8 transferTax) public onlyTeam{
+        require(marketingTaxes<=liquidityTaxes,"marketingTax needs to be <=liquidityTax");
         uint8 totalTax=burnTaxes+liquidityTaxes+marketingTaxes;
-        require(totalTax<=MaxTax,"total tax higher than maxTax");
+        require(totalTax==100, "burn+liq+marketing needs to equal 100%");
+        require(buyTax<=MaxTax&&sellTax<=MaxTax&&transferTax<=MaxTax,"taxes higher than max tax");
         
-        Tax memory newTax=Tax(burnTaxes,liquidityTaxes,marketingTaxes);
-        if(setBuy){
-            _buyTax=newTax;
-        }
-        if(setSell){
-            _sellTax=newTax;
-        }
-        if(setTransfer){
-             _transferTax=newTax;
-        }
+        _burnTax=burnTaxes;
+        _liquidityTax=liquidityTaxes;
+        _marketingTax=marketingTaxes;
+        
+        _buyTax=buyTax;
+        _sellTax=sellTax;
+        _transferTax=transferTax;
 
     }
     
     //manually converts contract token to LP and marketing BNB
-    function TeamCreateLPandBNB() public onlyTeam
-    {
-        _swapAutoLiquidity();
-        _swapMarketingBNB();
+    function TeamCreateLPandBNB() public onlyTeam{
+    _swapContractToken();
     }
-    
     //Exclude/Include account from fees (eg. CEX)
     function TeamExcludeAccountFromFees(address account) public onlyTeam {
         _excluded.add(account);
@@ -1273,7 +1250,6 @@ contract BurningMoon is IBEP20, Ownable
     function TeamIncludeAccountToFees(address account) public onlyTeam {
         _excluded.remove(account);
     }
-
      //Limits need to be at least 80% of target, to avoid setting value to 0(avoid potential Honeypot)
     function TeamUpdateLimits(uint256 newBalanceLimit, uint256 newSellLimit) public onlyTeam{
         //Adds decimals to limits
@@ -1306,7 +1282,7 @@ contract BurningMoon is IBEP20, Ownable
         _whiteListTrading=true;
         //Liquidity gets locked for 7 days at start, needs to be prolonged once
         //start is successful
-        _liquidityUnlockTime=block.timestamp+7 days;
+        _liquidityUnlockTime=block.timestamp+DefaultLiquidityLockTime;
     }
     function SetupEnableTrading() public onlyTeam{
         require(_tradingEnabled&&_whiteListTrading);
@@ -1315,7 +1291,6 @@ contract BurningMoon is IBEP20, Ownable
     function SetupLiquidityTokenAddress(address liquidityTokenAddress) public onlyTeam{
         _liquidityTokenAddress=liquidityTokenAddress;
     }
-
     //Functions for whitelist
     function SetupAddToWhitelist(address addressToAdd) public onlyTeam{
         _whiteList.add(addressToAdd);
@@ -1329,18 +1304,12 @@ contract BurningMoon is IBEP20, Ownable
     function SetupRemoveFromWhitelist(address addressToRemove) public onlyTeam{
         _whiteList.remove(addressToRemove);
     } 
-    function isWhitelisted(address AddressToCheck) public view returns(bool){
-        return _whiteList.contains(AddressToCheck);
-    }
-    
-
 
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
     //Liquidity Lock////////////////////////////////////////////////////////////////////////////////////////
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
     //the timestamp when Liquidity unlocks
     uint256 private _liquidityUnlockTime;
-
 
     //Sets Liquidity Release to 20% at a time and prolongs liquidity Lock for a Week after Release. 
     //Should be called once start was successful.
@@ -1362,7 +1331,12 @@ contract BurningMoon is IBEP20, Ownable
     function TeamUnlockLiquidityInAYear() public onlyTeam{
         _prolongLiquidityLock(block.timestamp+365 days);
     }
-    
+    function _prolongLiquidityLock(uint256 newUnlockTime) private{
+        // require new unlock time to be longer than old one
+        require(newUnlockTime>_liquidityUnlockTime);
+        _liquidityUnlockTime=newUnlockTime;
+    }
+
     //Release Liquidity Tokens once unlock time is over
     function TeamReleaseLiquidity() public onlyTeam {
         //Only callable if liquidity Unlock time is over
@@ -1376,7 +1350,7 @@ contract BurningMoon is IBEP20, Ownable
         amount=amount*2/10;
         liquidityToken.transfer(TeamWallet, amount);
 
-        _liquidityUnlockTime=block.timestamp+7 days;
+        _liquidityUnlockTime=block.timestamp+DefaultLiquidityLockTime;
         }
         else
         {
@@ -1385,12 +1359,6 @@ contract BurningMoon is IBEP20, Ownable
             liquidityToken.transfer(TeamWallet, amount);
         }
     }
-    function _prolongLiquidityLock(uint256 newUnlockTime) private{
-        // require new unlock time to be longer than old one
-        require(newUnlockTime>_liquidityUnlockTime);
-        _liquidityUnlockTime=newUnlockTime;
-    }
-    
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
     //external//////////////////////////////////////////////////////////////////////////////////////////////
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
