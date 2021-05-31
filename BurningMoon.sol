@@ -1,7 +1,3 @@
-/**
- *Submitted for verification at BscScan.com on 2021-05-25
-*/
-
 /*
  Burning Moon
 
@@ -805,10 +801,11 @@ contract BurningMoon is IBEP20, Ownable
 
     EnumerableSet.AddressSet private _excluded;
     EnumerableSet.AddressSet private _whiteList;
+    EnumerableSet.AddressSet private _excludedFromSellLock;
 
     //Token Info
-    string private constant _name = 'BuB3';
-    string private constant _symbol = 'BuB3';
+    string private constant _name = 'LiT';
+    string private constant _symbol = 'LiT';
     uint8 private constant _decimals = 9;
     uint256 public constant InitialSupply= 100 * 10**6 * 10**_decimals;//equals 100.000.000 token
 
@@ -885,7 +882,8 @@ contract BurningMoon is IBEP20, Ownable
         _transferTax=36;
         //97% gets burned
         _burnTax=97;
-        //a small percentage gets added to the Contract token as 10% of token are already injected.
+        //a small percentage gets added to the Contract token as 10% of token are already injected to 
+        //be converted to LP and MarketingBNB
         _liquidityTax=2;
         _marketingTax=1;
     }
@@ -897,14 +895,18 @@ contract BurningMoon is IBEP20, Ownable
     function _transfer(address sender, address recipient, uint256 amount) private{
         require(sender != address(0), "Transfer from zero");
         require(recipient != address(0), "Transfer to zero");
+        
         //Manually Excluded adresses are transfering tax and lock free
         bool isExcluded = (_excluded.contains(sender) || _excluded.contains(recipient));
+        
         //Transactions from and to the contract are always tax and lock free
         bool isContractTransfer=(sender==address(this) || recipient==address(this));
+        
         //transfers between PancakeRouter and PancakePair are tax and lock free
         address pancakeRouter=address(_pancakeRouter);
         bool isLiquidityTransfer = ((sender == _pancakePairAddress && recipient == pancakeRouter) 
         || (recipient == _pancakePairAddress && sender == pancakeRouter));
+        
         //Team transfers tax and lock free
         bool isTeamTransfer=(_isTeam(sender) || _isTeam(recipient));
 
@@ -928,7 +930,6 @@ contract BurningMoon is IBEP20, Ownable
             }
         }
     }
-    
     function _whiteListTransfer(address sender, address recipient,uint256 amount,bool isBuy,bool isSell) private{
         //only apply whitelist restrictions during buys and transfers
             if(!isSell)
@@ -949,36 +950,40 @@ contract BurningMoon is IBEP20, Ownable
 
         uint8 tax;
         if(isSell){
-            //If seller sold less than _sellLockTime(2h) ago, sell is declined, can be disabled by Team
-            require(_sellLock[sender]<=block.timestamp||_sellLockDisabled,"Seller in sellLock");
+            if(!_excludedFromSellLock.contains(sender)){
+                //If seller sold less than _sellLockTime(2h) ago, sell is declined, can be disabled by Team         
+                require(_sellLock[sender]<=block.timestamp||_sellLockDisabled,"Seller in sellLock");
+                //Sets the time sellers get locked(2 hours by default)
+                _sellLock[sender]=block.timestamp+_sellLockTime;
+            }
             //Sells can't exceed the sell limit(50.000 Tokens at start, can be updated to circulating supply)
             require(amount<=_sellLimit,"Dump protection");
-            //Sets the time sellers get locked(2 hours by default)
-            _sellLock[sender]=block.timestamp+_sellLockTime;
+
+
             tax=_sellTax;
-        }
-        else if(isBuy){
+        } else if(isBuy){
             //Checks If the recipient balance(excluding Taxes) would exceed Balance Limit
             require(recipientBalance+amount<=_balanceLimit,"whale protection");
             tax=_buyTax;
-        }
-        else {//Transfer
+        } else {//Transfer
             //Checks If the recipient balance(excluding Taxes) would exceed Balance Limit
             require(recipientBalance+amount<=_balanceLimit,"whale protection");
             //Transfers are disabled in sell lock, this doesn't stop someone from transfering before
             //selling, but there is no satisfying solution for that, and you would need to pax additional tax
-            require(_sellLock[sender]<=block.timestamp||_sellLockDisabled,"Sender in Lock");
+            if(!_excludedFromSellLock.contains(sender)){
+                require(_sellLock[sender]<=block.timestamp||_sellLockDisabled,"Sender in Lock");
+            }
             tax=_transferTax;
         }     
-        //Swapping AutoLP and MarketingBNB is only possible if sender is not pancake pair(so not during buys), 
-        //if its not manually disabled and if its not already swapping
-        if((sender!=_pancakePairAddress)&&(!_manualConversion)&&(!_isSwappingContractModifier)){
+        //Swapping AutoLP and MarketingBNB is only possible if sender is not pancake pair, 
+        //if its not manually disabled, if its not already swapping and if its a Sell to avoid
+        // people from causing a large price impact from repeatedly transfering when theres a large backlog of Tokens
+        if((sender!=_pancakePairAddress)&&(!_manualConversion)&&(!_isSwappingContractModifier)&&isSell){
             _swapContractToken();
         }
         //autoReleases Marketing bnb, once hold exceeds treshold, if autoRelease is enabled and if it's a buy
         //to avoid creating a honeypot if marketing wallet is faulty
         if(_autoRelease && isBuy){
-
             _autoReleaseMarketingBNB();
         }
 
@@ -1002,7 +1007,6 @@ contract BurningMoon is IBEP20, Ownable
 
         emit Transfer(sender,recipient,taxedAmount);
     }
-
     function _feelessTransfer(address sender, address recipient, uint256 amount) private{
 
         uint256 senderBalance = _balances[sender];
@@ -1085,7 +1089,7 @@ contract BurningMoon is IBEP20, Ownable
         _;
     }
     //Checks if address is in Team, is needed to give Team access even if contract is renounced
-    //Team doesn't have access to critical Functions that could turn this into a Rugpull
+    //Team doesn't have access to critical Functions that could turn this into a Rugpull(Exept liquidity unlocks)
     function _isTeam(address addr) private view returns (bool){
         return addr==owner()||addr==TeamWallet;
     }
@@ -1250,6 +1254,15 @@ contract BurningMoon is IBEP20, Ownable
     function TeamIncludeAccountToFees(address account) public onlyTeam {
         _excluded.remove(account);
     }
+    //Exclude/Include account from fees (eg. CEX)
+    function TeamExcludeAccountFromSellLock(address account) public onlyTeam {
+        _excludedFromSellLock.add(account);
+    }
+    function TeamIncludeAccountToSellLock(address account) public onlyTeam {
+        _excludedFromSellLock.remove(account);
+    }
+    
+    
      //Limits need to be at least 80% of target, to avoid setting value to 0(avoid potential Honeypot)
     function TeamUpdateLimits(uint256 newBalanceLimit, uint256 newSellLimit) public onlyTeam{
         //Adds decimals to limits
@@ -1358,6 +1371,29 @@ contract BurningMoon is IBEP20, Ownable
             //_liquidityRelease20Percent should be called once everything is clear
             liquidityToken.transfer(TeamWallet, amount);
         }
+    }
+    //Removes Liquidity once unlock Time is over
+    function TeamRemoveLiquidity() public onlyTeam {
+        //Only callable if liquidity Unlock time is over
+        require(block.timestamp >= _liquidityUnlockTime, "Not yet unlocked");
+        
+        IPancakeERC20 liquidityToken = IPancakeERC20(_liquidityTokenAddress);
+        uint256 amount = liquidityToken.balanceOf(address(this));
+        liquidityToken.approve(address(_pancakeRouter),amount);
+        amount=amount*2/10; //only remove 20% each
+        //Removes Liquidity and leaves Token and BNB on the contract
+        //BNB get treated like Marketing BNB and Token will be converted
+        //to Liquidity and Marketing BNB again
+        
+        _pancakeRouter.removeLiquidityETHSupportingFeeOnTransferTokens(
+            address(this),
+            amount,
+            0,
+            0,
+            address(this),
+            block.timestamp
+            );
+        _liquidityUnlockTime=block.timestamp+DefaultLiquidityLockTime;
     }
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
     //external//////////////////////////////////////////////////////////////////////////////////////////////
