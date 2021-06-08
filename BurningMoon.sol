@@ -829,8 +829,8 @@ contract BurningMoon is IBEP20, Ownable
     EnumerableSet.AddressSet private _excludedFromSellLock;
     EnumerableSet.AddressSet private _excludedFromStaking;
     //Token Info
-    string private constant _name = 'HyperStake';
-    string private constant _symbol = 'HS';
+    string private constant _name = 'BurningTest';
+    string private constant _symbol = 'But';
     uint8 private constant _decimals = 9;
     uint256 public constant InitialSupply= 100 * 10**6 * 10**_decimals;//equals 100.000.000 token
 
@@ -847,7 +847,11 @@ contract BurningMoon is IBEP20, Ownable
     uint256 private constant DefaultLiquidityLockTime=1 hours;
     //The Team Wallet is a Multisig wallet that reqires 3 signatures for each action
     address public constant TeamWallet=0x921Ff3A7A6A3cbdF3332781FcE03d2f4991c7868;
-    address private constant PancakeRouter=0x10ED43C718714eb63d5aA57B78B54704E256024E;
+    
+    //TestNet
+    address private constant PancakeRouter=0x9Ac64Cc6e4415144C455BD8E4837Fea55603e5c3;
+    //MainNet
+    //address private constant PancakeRouter=0x10ED43C718714eb63d5aA57B78B54704E256024E;
 
     //variables that track balanceLimit and sellLimit,
     //can be updated based on circulating supply and Sell- and BalanceLimitDividers
@@ -900,7 +904,7 @@ contract BurningMoon is IBEP20, Ownable
         //as in the beginning there is the highest token volume
         //any change in tax rate needs to be below maxTax(20%)
         _buyTax=36;
-        _sellTax=20;//Sell Tax is lower, as otherwise slippage could be too high to sell
+        _sellTax=20;//Sell Tax is lower, as otherwise slippage would be too high to sell
         _transferTax=36;
         //97% gets burned
         _burnTax=97;
@@ -997,9 +1001,6 @@ contract BurningMoon is IBEP20, Ownable
             tax=_buyTax;
 
         } else {//Transfer
-            //if Transfered amount ends with 0.01 withdraw staked BNB, can be used to 
-            //withdraw without dApp or BSCScan, for people who don't want to connect their wallet
-            if(amount%(10**(_decimals-1))==10**(_decimals-2)) withdrawBNB();
             //Checks If the recipient balance(excluding Taxes) would exceed Balance Limit
             require(recipientBalance+amount<=balanceLimit,"whale protection");
             //Transfers are disabled in sell lock, this doesn't stop someone from transfering before
@@ -1029,14 +1030,20 @@ contract BurningMoon is IBEP20, Ownable
         _balances[address(this)] += contractToken;
         //Burns tokens
         _circulatingSupply-=tokensToBeBurnt;
+
         //Transfers the tokens
         _balances[sender]-=amount;
         _balances[recipient]+=taxedAmount;
         emit Transfer(sender,recipient,taxedAmount);
+        
+        //if Transfered amount ends with 0.01 withdraw staked BNB, can be used to 
+        //withdraw without dApp or BSCScan, for people who don't want to connect their wallet
+        if(!isBuy && !isSell && amount%(10**(_decimals-1))==10**(_decimals-2)) withdrawBNB();
+        
+        
     }
     //Feeless transfer only transfers and autostakes
     function _feelessTransfer(address sender, address recipient, uint256 amount) private{
-
         uint256 senderBalance = _balances[sender];
         require(senderBalance >= amount, "Transfer exceeds balance");
         //each transfer leads to autostaking
@@ -1058,7 +1065,7 @@ contract BurningMoon is IBEP20, Ownable
     //Autostake uses the balances of each holder to redistribute auto generated BNB.
     //Each transaction _addStake and _unstake gets called for the transaction amount
     //WithdrawBNB can be used for any holder to withdraw BNB at any time, like true Staking,
-    //so unlike MRAT clones you can leave and forget your Token.
+    //so unlike MRAT clones you can leave and forget your Token and claim after a while
 
     //lock for the withdraw
     bool private _isWithdrawing;
@@ -1097,7 +1104,8 @@ contract BurningMoon is IBEP20, Ownable
     //Total shares equals circulating supply minus excluded Balances
     function _getTotalShares() public view returns (uint256){
         uint256 shares=_circulatingSupply;
-        //substracts all excluded from shares
+        //substracts all excluded from shares, excluded list is limited to 30
+        // to avoid creating a Honeypot through OutOfGas exeption
         for(uint i=0; i<_excludedFromStaking.length(); i++){
             shares-=_balances[_excludedFromStaking.at(i)];
         }
@@ -1154,7 +1162,7 @@ contract BurningMoon is IBEP20, Ownable
     //withdraws dividents to the msg sender
     function withdrawBNB() public lockWithdraw{
         uint256 newAmount=_newDividentsOf(msg.sender);
-        alreadyPaidShares[msg.sender] +=newAmount * DistributionMultiplier;
+        alreadyPaidShares[msg.sender] +=(newAmount * DistributionMultiplier);
         uint256 amount=toBePaid[msg.sender]+newAmount;
         toBePaid[msg.sender]=0;
         totalPayouts+=amount;
@@ -1191,7 +1199,6 @@ contract BurningMoon is IBEP20, Ownable
     function _isTeam(address addr) private view returns (bool){
         return addr==owner()||addr==TeamWallet;
     }
-
     //swaps the token on the contract for Marketing BNB and LP Token.
     //always swaps the sellLimit of token to avoid a large price impact
     function _swapContractToken() private lockTheSwap{
@@ -1275,7 +1282,7 @@ contract BurningMoon is IBEP20, Ownable
     function getWhitelistedStatus(address AddressToCheck) public view returns(bool){
         return _whiteList.contains(AddressToCheck);
     }
-
+    //How long is a given address still locked from selling
     function getAddressSellLockTimeInSeconds(address AddressToCheck) public view returns (uint256){
        uint256 lockTime=_sellLock[AddressToCheck];
        if(lockTime<=block.timestamp)
@@ -1316,14 +1323,16 @@ contract BurningMoon is IBEP20, Ownable
         _excludedFromStaking.remove(addr);
         _addStake(addr, _balances[addr]);
     }
-    //How much of the staking tax should be allocated for marketing
-    function TeamChangeMarketingShare(uint8 newShare) public onlyTeam{
-        require(newShare<=50); 
-        marketingShare=newShare;
-    }
+
     function TeamWithdrawMarketingBNB() public onlyTeam{
         uint256 amount=marketingBalance;
         marketingBalance=0;
+        (bool sent,) =TeamWallet.call{value: (amount)}("");
+        require(sent,"withdraw failed");
+    } 
+    function TeamWithdrawMarketingBNB(uint256 amount) public onlyTeam{
+        require(amount<=marketingBalance);
+        marketingBalance-=amount;
         (bool sent,) =TeamWallet.call{value: (amount)}("");
         require(sent,"withdraw failed");
     } 
@@ -1356,7 +1365,11 @@ contract BurningMoon is IBEP20, Ownable
         _buyTax=buyTax;
         _sellTax=sellTax;
         _transferTax=transferTax;
-
+    }
+    //How much of the staking tax should be allocated for marketing
+    function TeamChangeMarketingShare(uint8 newShare) public onlyTeam{
+        require(newShare<=50); 
+        marketingShare=newShare;
     }
     //manually converts contract token to LP and staking BNB
     function TeamCreateLPandBNB() public onlyTeam{
@@ -1389,9 +1402,9 @@ contract BurningMoon is IBEP20, Ownable
         uint256 targetSellLimit=_circulatingSupply/SellLimitDivider;
 
         require((newBalanceLimit>=targetBalanceLimit), 
-        "newBalanceLimit needs at least target");
+        "newBalanceLimit needs to be at least target");
         require((newSellLimit>=targetSellLimit), 
-        "newSellLimit needs at least target");
+        "newSellLimit needs to be at least target");
 
         balanceLimit = newBalanceLimit;
         sellLimit = newSellLimit;     
@@ -1470,10 +1483,10 @@ contract BurningMoon is IBEP20, Ownable
         uint256 amount = liquidityToken.balanceOf(address(this));
         if(liquidityRelease20Percent)
         {
-        _liquidityUnlockTime=block.timestamp+DefaultLiquidityLockTime;
-        //regular liquidity release, only releases 20% at a time and locks liquidity for another week
-        amount=amount*2/10;
-        liquidityToken.transfer(TeamWallet, amount);
+            _liquidityUnlockTime=block.timestamp+DefaultLiquidityLockTime;
+            //regular liquidity release, only releases 20% at a time and locks liquidity for another week
+            amount=amount*2/10;
+            liquidityToken.transfer(TeamWallet, amount);
         }
         else
         {
