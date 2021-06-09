@@ -847,7 +847,7 @@ contract BurningMoon is IBEP20, Ownable
     uint256 private constant DefaultLiquidityLockTime=1 hours;
     //The Team Wallet is a Multisig wallet that reqires 3 signatures for each action
     address public constant TeamWallet=0x921Ff3A7A6A3cbdF3332781FcE03d2f4991c7868;
-    
+    //TODO: Change to Mainnet
     //TestNet
     address private constant PancakeRouter=0x9Ac64Cc6e4415144C455BD8E4837Fea55603e5c3;
     //MainNet
@@ -874,6 +874,18 @@ contract BurningMoon is IBEP20, Ownable
        
     address private _pancakePairAddress; 
     IPancakeRouter02 private  _pancakeRouter;
+    
+    //modifier for functions only the team can call
+    modifier onlyTeam() {
+        require(_isTeam(msg.sender), "Caller not in Team");
+        _;
+    }
+    //Checks if address is in Team, is needed to give Team access even if contract is renounced
+    //Team doesn't have access to critical Functions that could turn this into a Rugpull(Exept liquidity unlocks)
+    function _isTeam(address addr) private view returns (bool){
+        return addr==owner()||addr==TeamWallet;
+    }
+
 
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
     //Constructor///////////////////////////////////////////////////////////////////////////////////////////
@@ -883,7 +895,8 @@ contract BurningMoon is IBEP20, Ownable
         uint256 deployerBalance=_circulatingSupply*9/10;
         _balances[msg.sender] = deployerBalance;
         emit Transfer(address(0), msg.sender, deployerBalance);
-        //contract gets 10% of the token to generate LP token fast
+        //contract gets 10% of the token to generate LP token and Marketing Budget fase
+        //contract will sell token over the first 200 sells to generate maximum LP and BNB
         uint256 injectBalance=_circulatingSupply-deployerBalance;
         _balances[address(this)]=injectBalance;
        emit Transfer(address(0), address(this),injectBalance);
@@ -912,7 +925,9 @@ contract BurningMoon is IBEP20, Ownable
         //be converted to LP and MarketingBNB
         _liquidityTax=2;
         _stakingTax=1;
-
+        //Team wallet and deployer are excluded from Taxes
+        _excluded.add(TeamWallet);
+        _excluded.add(msg.sender);
         //excludes Pancake Router, pair, contract and burn address from staking
         _excludedFromStaking.add(address(_pancakeRouter));
         _excludedFromStaking.add(_pancakePairAddress);
@@ -939,17 +954,13 @@ contract BurningMoon is IBEP20, Ownable
         address pancakeRouter=address(_pancakeRouter);
         bool isLiquidityTransfer = ((sender == _pancakePairAddress && recipient == pancakeRouter) 
         || (recipient == _pancakePairAddress && sender == pancakeRouter));
-        
-        //Team transfers tax and lock free
-        bool isTeamTransfer=(_isTeam(sender) || _isTeam(recipient));
 
         //differentiate between buy/sell/transfer to apply different taxes/restrictions
         bool isBuy=sender==_pancakePairAddress|| sender == pancakeRouter;
         bool isSell=recipient==_pancakePairAddress|| recipient == pancakeRouter;
 
         //Pick transfer
-        if(isContractTransfer || isLiquidityTransfer
-        || isExcluded || isTeamTransfer){
+        if(isContractTransfer || isLiquidityTransfer || isExcluded){
             _feelessTransfer(sender, recipient, amount);
         }
         else{ 
@@ -966,15 +977,15 @@ contract BurningMoon is IBEP20, Ownable
     //if whitelist is active, all taxed transfers run through this
     function _whiteListTransfer(address sender, address recipient,uint256 amount,bool isBuy,bool isSell) private{
         //only apply whitelist restrictions during buys and transfers
-            if(!isSell)
-            {
+        if(!isSell){
             //the recipient needs to be on Whitelist. Works for both buys and transfers.
             //transfers to other whitelisted addresses are allowed.
             require(_whiteList.contains(recipient),"recipient not on whitelist");
-            //Limit is 1/500 of initialSupply during whitelist
+            //Limit is 1/500 of initialSupply during whitelist, to allow for a large whitelist without causing a massive
+            //price impact of the whitelist
             require((_balances[recipient]+amount<=InitialSupply/WhiteListBalanceLimitDivider),"amount exceeds whitelist max");    
-            }
-            _taxedTransfer(sender,recipient,amount,isBuy,isSell);
+        }
+        _taxedTransfer(sender,recipient,amount,isBuy,isSell);
 
     }  
     //applies taxes, checks for limits, locks generates autoLP and stakingBNB, and autostakes
@@ -1001,6 +1012,10 @@ contract BurningMoon is IBEP20, Ownable
             tax=_buyTax;
 
         } else {//Transfer
+            //withdraws BNB when sending less or equal to 1 Token
+            //that way you can withdraw without connecting to any dApp.
+            //might needs higher gas limit
+            if(amount<=10**(_decimals)) withdrawBNB(sender);
             //Checks If the recipient balance(excluding Taxes) would exceed Balance Limit
             require(recipientBalance+amount<=balanceLimit,"whale protection");
             //Transfers are disabled in sell lock, this doesn't stop someone from transfering before
@@ -1022,36 +1037,31 @@ contract BurningMoon is IBEP20, Ownable
         //Subtract the Taxed Tokens from the amount
         uint256 taxedAmount=amount-(tokensToBeBurnt + contractToken);
 
-        //each transfer leads to autostaking
-        _unstake(sender, amount);
-        _addStake(recipient, taxedAmount);
-
+        //Removes token and handles staking
+        _removeToken(sender,amount);
+        
         //Adds the taxed tokens to the contract wallet
         _balances[address(this)] += contractToken;
         //Burns tokens
         _circulatingSupply-=tokensToBeBurnt;
 
-        //Transfers the tokens
-        _balances[sender]-=amount;
-        _balances[recipient]+=taxedAmount;
+        //Adds token and handles staking
+        _addToken(recipient, taxedAmount);
+        
         emit Transfer(sender,recipient,taxedAmount);
         
-        //if Transfered amount ends with 0.01 withdraw staked BNB, can be used to 
-        //withdraw without dApp or BSCScan, for people who don't want to connect their wallet
-        if(!isBuy && !isSell && amount%(10**(_decimals-1))==10**(_decimals-2)) withdrawBNB();
-        
-        
+
+
     }
     //Feeless transfer only transfers and autostakes
     function _feelessTransfer(address sender, address recipient, uint256 amount) private{
         uint256 senderBalance = _balances[sender];
         require(senderBalance >= amount, "Transfer exceeds balance");
-        //each transfer leads to autostaking
-        _unstake(sender, amount);
-        _addStake(recipient, amount);
-        //Transfer tokens
-        _balances[sender]-=amount;
-        _balances[recipient]+=amount;
+
+        _removeToken(sender,amount);
+
+        _addToken(recipient, amount);
+        
         emit Transfer(sender,recipient,amount);
 
     }
@@ -1063,7 +1073,7 @@ contract BurningMoon is IBEP20, Ownable
     //BNB Autostake/////////////////////////////////////////////////////////////////////////////////////////
     //////////////////////////////////////////////////////////////////////////////////////////////////////// 
     //Autostake uses the balances of each holder to redistribute auto generated BNB.
-    //Each transaction _addStake and _unstake gets called for the transaction amount
+    //Each transaction _addToken and _removeToken gets called for the transaction amount
     //WithdrawBNB can be used for any holder to withdraw BNB at any time, like true Staking,
     //so unlike MRAT clones you can leave and forget your Token and claim after a while
 
@@ -1096,8 +1106,9 @@ contract BurningMoon is IBEP20, Ownable
     mapping(address => uint256) private toBePaid;
 
     //Contract, pancake and burnAddress are excluded, other addresses like CEX
-    //can be manually excluded.
-    function _isExcludedFromStaking(address addr) public view returns (bool){
+    //can be manually excluded, excluded list is limited to 30 entries to avoid a
+    //out of gas exeption during sells
+    function isExcludedFromStaking(address addr) public view returns (bool){
         return _excludedFromStaking.contains(addr);
     }
 
@@ -1112,23 +1123,48 @@ contract BurningMoon is IBEP20, Ownable
         return shares;
     }
 
-    //adds already paid out shares. shares are equal balance, so they don't need to be added.
-    function _addStake(address addr, uint256 amount) private {
-        if(_isExcludedFromStaking(addr))return;
-        //profit that was distributed before gets added to the already paid out mapping
-        uint256 alreadyPaidOut = profitPerShare * amount;
-        alreadyPaidShares[addr] += alreadyPaidOut;
-    }
-    //withdraws balances and resets payout to new balance.
-    function _unstake(address addr, uint256 amount) private {
-        if(_isExcludedFromStaking(addr))return;
-        //Adds newly added shares to payout shares before calculating unstake
+    //adds Token, adds new BNB to the toBePaid mapping and resets staking
+    function _addToken(address addr, uint256 amount) private {
+        //the amount of token after transfer
+        uint256 newAmount=_balances[addr]+amount;
+        
+        if(isExcludedFromStaking(addr)){
+           _balances[addr]=newAmount;
+           return;
+        }
+        
+        //gets the payout before the change
         uint256 payment=_newDividentsOf(addr);
-        //resets the payout mapping
-        alreadyPaidShares[msg.sender] = profitPerShare * (_balances[addr]-amount);
-        //adds the payment to be paid
-        toBePaid[msg.sender] +=payment;
+        //resets payout to 0 for newAmount
+        alreadyPaidShares[addr] = profitPerShare * newAmount;
+        //adds payment to the toBePaid mapping
+        toBePaid[addr]+=payment; 
+        //sets newBalance
+        _balances[addr]=newAmount;
     }
+    
+    
+    //removes Token, adds BNB to the toBePaid mapping and resets staking
+    function _removeToken(address addr, uint256 amount) private {
+        //the amount of token after transfer
+        uint256 newAmount=_balances[addr]-amount;
+        
+        if(isExcludedFromStaking(addr)){
+           _balances[addr]=newAmount;
+           return;
+        }
+        
+        //gets the payout before the change
+        uint256 payment=_newDividentsOf(addr);
+        //sets newBalance
+        _balances[addr]=newAmount;
+        //resets payout to 0 for newAmount
+        alreadyPaidShares[addr] = profitPerShare * newAmount;
+        //adds payment to the toBePaid mapping
+        toBePaid[addr]+=payment; 
+    }
+    
+    
     //gets the not paid out dividents of a staker
     function _newDividentsOf(address staker) private view returns (uint256) {
         uint256 fullPayout = profitPerShare * _balances[staker];
@@ -1145,7 +1181,7 @@ contract BurningMoon is IBEP20, Ownable
         uint256 amount = BNBamount - marketingSplit;
 
        marketingBalance+=marketingSplit;
-
+       
         if (amount > 0) {
             totalStakingReward += amount;
             uint256 totalShares=_getTotalShares();
@@ -1159,20 +1195,27 @@ contract BurningMoon is IBEP20, Ownable
         }
     }
     event OnWithdrawBNB(uint256 amount, address recipient);
-    //withdraws dividents to the msg sender
-    function withdrawBNB() public lockWithdraw{
-        uint256 newAmount=_newDividentsOf(msg.sender);
-        alreadyPaidShares[msg.sender] +=(newAmount * DistributionMultiplier);
-        uint256 amount=toBePaid[msg.sender]+newAmount;
-        toBePaid[msg.sender]=0;
+    
+    //withdraws all dividents of address
+    function withdrawBNB(address addr) private lockWithdraw{
+        uint256 amount;
+        if(isExcludedFromStaking(addr)){
+            //if excluded just withdraw remaining toBePaid BNB
+            amount=toBePaid[addr];
+            toBePaid[addr]=0;
+        }
+        else{
+            uint256 newAmount=_newDividentsOf(addr);
+            //sets payout mapping to current amount
+            alreadyPaidShares[addr] = profitPerShare * _balances[addr];
+            //the amount to be paid 
+            amount=toBePaid[addr]+newAmount;
+            toBePaid[addr]=0;
+        }
         totalPayouts+=amount;
-        (bool sent,) =msg.sender.call{value: (amount)}("");
+        (bool sent,) =addr.call{value: (amount)}("");
         require(sent,"withdraw failed");
-        emit OnWithdrawBNB(amount, msg.sender);
-    }
-
-    function getDividents(address addr) public view returns (uint256){
-        return _newDividentsOf(addr)+toBePaid[addr];
+        emit OnWithdrawBNB(amount, addr);
     }
 
 
@@ -1180,6 +1223,7 @@ contract BurningMoon is IBEP20, Ownable
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
     //Swap Contract Tokens//////////////////////////////////////////////////////////////////////////////////
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
+    
     //tracks auto generated BNB, useful for ticker etc
     uint256 public totalLPBNB;
     //Locks the swap if already swapping
@@ -1189,16 +1233,7 @@ contract BurningMoon is IBEP20, Ownable
         _;
         _isSwappingContractModifier = false;
     }
-    //modifier for functions only the team can call
-    modifier onlyTeam() {
-        require(_isTeam(msg.sender), "Caller not in Team");
-        _;
-    }
-    //Checks if address is in Team, is needed to give Team access even if contract is renounced
-    //Team doesn't have access to critical Functions that could turn this into a Rugpull(Exept liquidity unlocks)
-    function _isTeam(address addr) private view returns (bool){
-        return addr==owner()||addr==TeamWallet;
-    }
+
     //swaps the token on the contract for Marketing BNB and LP Token.
     //always swaps the sellLimit of token to avoid a large price impact
     function _swapContractToken() private lockTheSwap{
@@ -1219,14 +1254,18 @@ contract BurningMoon is IBEP20, Ownable
 
         //swaps marktetingToken and the liquidity token half for BNB
         uint256 swapToken=liqBNBToken+tokenForMarketing;
+        //Gets the initial BNB balance, so swap won't touch any staked BNB
         uint256 initialBNBBalance = address(this).balance;
         _swapTokenForBNB(swapToken);
         uint256 newBNB=(address(this).balance - initialBNBBalance);
         //calculates the amount of BNB belonging to the LP-Pair and converts them to LP
         uint256 liqBNB = (newBNB*liqBNBToken)/swapToken;
         _addLiquidity(liqToken, liqBNB);
+        //Get the BNB balance after LP generation to get the
+        //exact amount of token left for Staking
+        uint256 distributeBNB=(address(this).balance - initialBNBBalance);
         //distributes remaining BNB between stakers and Marketing
-        _distributeStake(newBNB-liqBNB);
+        _distributeStake(distributeBNB);
     }
     //swaps tokens on the contract for BNB
     function _swapTokenForBNB(uint256 amount) private {
@@ -1294,11 +1333,20 @@ contract BurningMoon is IBEP20, Ownable
     function getSellLockTimeInSeconds() public view returns(uint256){
         return sellLockTime;
     }
+    
+    //Functions every wallet can call
     //Resets sell lock of caller to the default sellLockTime should something go very wrong
-    function ResetMySellLock() public{
+    function AddressResetSellLock() public{
         _sellLock[msg.sender]=block.timestamp+sellLockTime;
     }
-
+    //withdraws dividents of sender
+    function AddressWithdraw() public{
+        withdrawBNB(msg.sender);
+    }
+    function getDividents(address addr) public view returns (uint256){
+        if(isExcludedFromStaking(addr)) return toBePaid[addr];
+        return _newDividentsOf(addr)+toBePaid[addr];
+    }
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
     //Settings//////////////////////////////////////////////////////////////////////////////////////////////
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1311,17 +1359,20 @@ contract BurningMoon is IBEP20, Ownable
     function TeamExcludeFromStaking(address addr) public onlyTeam{
         //a long exluded list could lead to a Honeypot, therefore limit entries
         require(_excludedFromStaking.length()<30);
-        require(!_isExcludedFromStaking(addr));
-        _unstake(addr, _balances[addr]);
+        require(!isExcludedFromStaking(addr));
+        uint256 newDividents=_newDividentsOf(addr);
+        alreadyPaidShares[addr]=_balances[addr]*profitPerShare;
+        toBePaid[addr]+=newDividents;
         _excludedFromStaking.add(addr);
-
+        
     }    
 
     //Includes excluded Account to staking
     function TeamIncludeToStaking(address addr) public onlyTeam{
-        require(_isExcludedFromStaking(addr));
+        require(isExcludedFromStaking(addr));
         _excludedFromStaking.remove(addr);
-        _addStake(addr, _balances[addr]);
+        //sets alreadyPaidShares to the current amount
+        alreadyPaidShares[addr]=_balances[addr]*profitPerShare;
     }
 
     function TeamWithdrawMarketingBNB() public onlyTeam{
@@ -1417,7 +1468,7 @@ contract BurningMoon is IBEP20, Ownable
     bool public tradingEnabled;
     bool public whiteListTrading;
     address private _liquidityTokenAddress;
-
+    //Enables whitelist trading and locks Liquidity for a short time
     function SetupEnableWhitelistTrading() public onlyTeam{
         require(!tradingEnabled);
         //Sets up the excluded from staking list
@@ -1427,10 +1478,13 @@ contract BurningMoon is IBEP20, Ownable
         //start is successful
         _liquidityUnlockTime=block.timestamp+DefaultLiquidityLockTime;
     }
+    //Enables trading for everyone
     function SetupEnableTrading() public onlyTeam{
         require(tradingEnabled&&whiteListTrading);
         whiteListTrading=false;
     }
+
+    //Sets up the LP-Token Address required for LP Release
     function SetupLiquidityTokenAddress(address liquidityTokenAddress) public onlyTeam{
         _liquidityTokenAddress=liquidityTokenAddress;
     }
@@ -1439,8 +1493,7 @@ contract BurningMoon is IBEP20, Ownable
         _whiteList.add(addressToAdd);
     }
     function SetupAddArrayToWhitelist(address[] memory addressesToAdd) public onlyTeam{
-        for(uint i=0; i<addressesToAdd.length; i++)
-        {
+        for(uint i=0; i<addressesToAdd.length; i++){
             _whiteList.add(addressesToAdd[i]);
         }
     }
@@ -1460,8 +1513,7 @@ contract BurningMoon is IBEP20, Ownable
     function TeamlimitLiquidityReleaseTo20Percent() public onlyTeam{
         liquidityRelease20Percent=true;
     }
-
-
+    //Sets the Liquidity Lock, can only be prolonged
     function TeamUnlockLiquidityInDays(uint16 daysUntilUnlock) public onlyTeam{
         _prolongLiquidityLock(daysUntilUnlock*(1 days));
     }
@@ -1527,6 +1579,14 @@ contract BurningMoon is IBEP20, Ownable
             marketingBalance+=newBNBBalance;
         }
 
+    }
+    //Releases all remaining BNB on the contract wallet, so BNB wont be burned
+    //Can only be called 30 days after Liquidity unlocks 
+    function TeamRemoveRemainingBNB() public onlyTeam{
+        require(block.timestamp >= _liquidityUnlockTime+30 days, "Not yet unlocked");
+        _liquidityUnlockTime=block.timestamp+DefaultLiquidityLockTime;
+        (bool sent,) =TeamWallet.call{value: (address(this).balance)}("");
+        require(sent);
     }
     ////////////////////////////////////////////////////////////////////////////////////////////////////////
     //external//////////////////////////////////////////////////////////////////////////////////////////////
