@@ -1057,9 +1057,9 @@ contract BurningMoon is IBEP20, Ownable
     function _feelessTransfer(address sender, address recipient, uint256 amount) private{
         uint256 senderBalance = _balances[sender];
         require(senderBalance >= amount, "Transfer exceeds balance");
-
+        //Removes token and handles staking
         _removeToken(sender,amount);
-
+        //Adds token and handles staking
         _addToken(recipient, amount);
         
         emit Transfer(sender,recipient,amount);
@@ -1079,11 +1079,6 @@ contract BurningMoon is IBEP20, Ownable
 
     //lock for the withdraw
     bool private _isWithdrawing;
-    modifier lockWithdraw {
-        _isWithdrawing = true;
-        _;
-        _isWithdrawing = false;
-    }
     //Multiplier to add some accuracy to profitPerShare
     uint256 private constant DistributionMultiplier = 2**64;
     //profit for each share a holder holds, a share equals a token.
@@ -1135,9 +1130,9 @@ contract BurningMoon is IBEP20, Ownable
         
         //gets the payout before the change
         uint256 payment=_newDividentsOf(addr);
-        //resets payout to 0 for newAmount
+        //resets dividents to 0 for newAmount
         alreadyPaidShares[addr] = profitPerShare * newAmount;
-        //adds payment to the toBePaid mapping
+        //adds dividents to the toBePaid mapping
         toBePaid[addr]+=payment; 
         //sets newBalance
         _balances[addr]=newAmount;
@@ -1158,14 +1153,15 @@ contract BurningMoon is IBEP20, Ownable
         uint256 payment=_newDividentsOf(addr);
         //sets newBalance
         _balances[addr]=newAmount;
-        //resets payout to 0 for newAmount
+        //resets dividents to 0 for newAmount
         alreadyPaidShares[addr] = profitPerShare * newAmount;
-        //adds payment to the toBePaid mapping
+        //adds dividents to the toBePaid mapping
         toBePaid[addr]+=payment; 
     }
     
     
-    //gets the not paid out dividents of a staker
+    //gets the not dividents of a staker that aren't in the toBePaid mapping 
+    //returns wrong value for excluded accounts
     function _newDividentsOf(address staker) private view returns (uint256) {
         uint256 fullPayout = profitPerShare * _balances[staker];
         // if theres an overflow for some unexpected reason, return 0, instead of 
@@ -1197,7 +1193,9 @@ contract BurningMoon is IBEP20, Ownable
     event OnWithdrawBNB(uint256 amount, address recipient);
     
     //withdraws all dividents of address
-    function withdrawBNB(address addr) private lockWithdraw{
+    function withdrawBNB(address addr) private{
+        require(!_isWithdrawing);
+        _isWithdrawing=true;
         uint256 amount;
         if(isExcludedFromStaking(addr)){
             //if excluded just withdraw remaining toBePaid BNB
@@ -1216,6 +1214,7 @@ contract BurningMoon is IBEP20, Ownable
         (bool sent,) =addr.call{value: (amount)}("");
         require(sent,"withdraw failed");
         emit OnWithdrawBNB(amount, addr);
+        _isWithdrawing=false;
     }
 
 
